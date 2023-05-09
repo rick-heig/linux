@@ -60,6 +60,13 @@
 #define pci_epf_nvme_prp_size(prp)	\
 	((size_t)(NVME_CTRL_PAGE_SIZE - pci_epf_nvme_prp_ofst(prp)))
 
+/* Controller Memory Buffer Size */
+#define CMB_SIZE			(4 * 1024 * 1024)
+#define CMB_PAGE_SHIFT			12
+#define CMB_PAGE_SIZE			(1 << CMB_PAGE_SHIFT)
+#define CMB_BIR_MASK			0x7
+#define CMB_BIR				2
+
 static struct workqueue_struct *epf_nvme_reg_wq;
 static struct workqueue_struct *epf_nvme_sq_wq;
 static struct kmem_cache *epf_nvme_cmd_cache;
@@ -108,6 +115,8 @@ struct pci_epf_nvme_ctrl {
 	u32		aqa;
 	u64		asq;
 	u64		acq;
+	u32		cmbloc;
+	u32		cmbsz;
 
 	size_t		adm_sqes;
 	size_t		adm_cqes;
@@ -446,6 +455,7 @@ terminate:
 	return ret;
 }
 
+/** @todo Maybe remove the map here */
 static int pci_epf_nvme_dma_transfer(struct pci_epf_nvme *nvme,
 				     struct pci_epc_map *map,
 				     enum dma_data_direction dir,
@@ -1360,7 +1370,15 @@ static void pci_epf_nvme_ctrl_init(struct pci_epf_nvme *nvme)
 	ctrl->cap &= ~(0x1ULL << 56);
 
 	/* Controller Memory Buffer Supported (CMBS) */
-	ctrl->cap &= ~(0x1ULL << 57);
+	ctrl->cap |= 0x1ULL << 57;
+
+	/* Controller Memory Buffer Location, BIR = 2 */
+	ctrl->cmbloc = CMB_BIR;
+
+	/* Controller Memory Buffer Size (CMB page 4kB when SZU set to 0) */
+	ctrl->cmbsz = (CMB_SIZE >> CMB_PAGE_SHIFT) << 12;
+	ctrl->cmbsz |= 1 << 4; /* WDS */
+	ctrl->cmbsz |= 1 << 3; /* RDS */
 
 	/* Subsystem compliance spec version (1.3.0 by default) */
 	ctrl->vs = NVMET_DEFAULT_VS;
@@ -1378,6 +1396,8 @@ static void pci_epf_nvme_ctrl_init(struct pci_epf_nvme *nvme)
 	pci_epf_nvme_reg_write32(ctrl, NVME_REG_VS, ctrl->vs);
 	pci_epf_nvme_reg_write32(ctrl, NVME_REG_CSTS, ctrl->csts);
 	pci_epf_nvme_reg_write32(ctrl, NVME_REG_CC, ctrl->cc);
+	pci_epf_nvme_reg_write32(ctrl, NVME_REG_CMBLOC, ctrl->cmbloc);
+	pci_epf_nvme_reg_write32(ctrl, NVME_REG_CMBSZ, ctrl->cmbsz);
 }
 
 static void pci_epf_nvme_ctrl_unmap_cq(struct pci_epf_nvme *nvme, int qid)
@@ -2068,6 +2088,9 @@ static int pci_epf_nvme_set_bars(struct pci_epf_nvme *nvme)
 		if (features->reserved_bar & (1 << bar))
 			continue;
 
+		if (!nvme->reg[bar])
+			continue;
+
 		ret = pci_epf_set_bar(epf, epf_bar);
 		if (ret) {
 			dev_err(&epf->dev, "Failed to set BAR%d\n", bar);
@@ -2164,6 +2187,19 @@ static int pci_epf_nvme_configure_bars(struct pci_epf_nvme *nvme)
 	if (ret)
 		return ret;
 
+	if (CMB_BIR == 1) {
+		pr_warn("BIR cannot be 1 per NVMe specifications !\n");
+		return -EINVAL;
+	}
+	if (CMB_BIR == bar) {
+		/* It might be possible for the CMB to be in the same BAR with
+		 * an offset, but this requires to be checked. The bir can only
+		 * point to BAR 0,2,3,4,5 */
+		pr_warn("BIR points to reg BAR !\n");
+		/** @todo Implement CMB + Reg bar sharing */
+		return -EINVAL;
+	}
+
 	/* Allocate remaining BARs */
 	for (bar = BAR_0; bar < PCI_STD_NUM_BARS; bar += add) {
 		epf_bar = &epf->bar[bar];
@@ -2179,7 +2215,16 @@ static int pci_epf_nvme_configure_bars(struct pci_epf_nvme *nvme)
 		if (nvme->reg[bar] || features->reserved_bar & (1 << bar))
 			continue;
 
-		bar_size = max_t(size_t, features->bar_fixed_size[bar], SZ_4K);
+		if (bar == CMB_BIR) {
+			bar_size = max_t(size_t, features->bar_fixed_size[bar],
+					 CMB_SIZE);
+			if (bar_size < CMB_SIZE) {
+				pr_warn("BAR too small for CMB\n!");
+			}
+		} else {
+			bar_size = max_t(size_t, features->bar_fixed_size[bar],
+					 SZ_4K);
+		}
 		nvme->reg[bar] = pci_epf_alloc_space(epf, bar_size, bar,
 						PAGE_SIZE, PRIMARY_INTERFACE);
 		if (!nvme->reg[bar]) {
