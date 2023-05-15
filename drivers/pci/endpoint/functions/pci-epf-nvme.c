@@ -823,7 +823,9 @@ static int pci_epf_nvme_cmd_parse_prp_list(struct pci_epf_nvme *nvme,
 	if (!prp)
 		goto invalid_field;
 
-	nr_segs = (transfer_len + NVME_CTRL_PAGE_SIZE - 1)
+	ofst = pci_epf_nvme_prp_ofst(prp);
+
+	nr_segs = (transfer_len + ofst + NVME_CTRL_PAGE_SIZE - 1)
 		>> NVME_CTRL_PAGE_SHIFT;
 
 	ret = pci_epf_nvme_alloc_cmd_segs(epcmd, nr_segs);
@@ -834,7 +836,6 @@ static int pci_epf_nvme_cmd_parse_prp_list(struct pci_epf_nvme *nvme,
 	seg = &epcmd->segs[0];
 	seg->pci_addr = prp;
 	seg->size = pci_epf_nvme_prp_size(prp);
-	ofst = pci_epf_nvme_prp_ofst(prp);
 
 	size = seg->size;
 	pci_addr = prp + size;
