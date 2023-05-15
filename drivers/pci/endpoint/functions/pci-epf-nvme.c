@@ -879,8 +879,13 @@ static int pci_epf_nvme_cmd_parse_prp_list(struct pci_epf_nvme *nvme,
 		if (pci_epf_nvme_prp_ofst(prp))
 			goto invalid_offset;
 
-		if (prp != pci_addr) {
-			/* Discontiguous prp: new segment */
+		/* If PRPs are discontiguous or cross a window boundary :
+		   ceate a new segment. Note that pci_addr except for the
+		   first PRP will be aligned to PRP size and window size is
+		   a multiple of PRP size so the crossing will happen when
+		   the next PRP is the start of a window (bits are 0) */
+		if (prp != pci_addr ||
+		    (pci_addr & (nvme->epc_features->window_size-1)) == 0) {
 			nr_segs++;
 			if (WARN_ON_ONCE(nr_segs > epcmd->nr_segs))
 				goto internal;

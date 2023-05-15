@@ -466,6 +466,7 @@ static const struct pci_epc_features rockchip_pcie_epc_features = {
 	.msi_capable = true,
 	.msix_capable = false,
 	.align = 256,
+	.window_size = SZ_1M,
 };
 
 static const struct pci_epc_features*

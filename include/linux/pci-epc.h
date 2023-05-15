@@ -174,6 +174,7 @@ struct pci_epc {
  * @bar_fixed_64bit: bitmap to indicate fixed 64bit BARs
  * @bar_fixed_size: Array specifying the size supported by each BAR
  * @align: alignment size required for BAR buffer allocation
+ * @window_size: size of the window aperture into PCI space
  */
 struct pci_epc_features {
 	unsigned int	linkup_notifier : 1;
@@ -184,6 +185,7 @@ struct pci_epc_features {
 	u8	bar_fixed_64bit;
 	u64	bar_fixed_size[PCI_STD_NUM_BARS];
 	size_t	align;
+	size_t	window_size;
 };
 
 /**
