@@ -526,6 +526,7 @@ int pci_epc_mem_map(struct pci_epc *epc, u8 func_no, u8 vfunc_no,
 		    u64 pci_addr, size_t size, struct pci_epc_map *map)
 {
 	phys_addr_t phys_ofst = 0;
+	ssize_t ret_map_size;
 	int ret;
 
 	if (!pci_epc_check_func(epc, func_no, vfunc_no))
@@ -536,11 +537,12 @@ int pci_epc_mem_map(struct pci_epc *epc, u8 func_no, u8 vfunc_no,
 
 	map->pci_size = size;
 	map->pci_addr = pci_addr;
-	map->phys_size = pci_epc_map_size(epc, func_no, vfunc_no,
-				     pci_addr, size, &phys_ofst);
-	if (map->phys_size < 0)
-		return map->phys_size;
+	ret_map_size = pci_epc_map_size(epc, func_no, vfunc_no,
+					pci_addr, size, &phys_ofst);
+	if (ret_map_size < 0)
+		return ret_map_size;
 
+	map->phys_size = ret_map_size;
 	map->virt_base = pci_epc_mem_alloc_addr(epc, &map->phys_base,
 						map->phys_size);
 	if (!map->virt_base)
