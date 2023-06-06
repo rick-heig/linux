@@ -782,22 +782,19 @@ pci_epf_nvme_fetch_cmd(struct pci_epf_nvme *nvme, int qid)
 static int pci_epf_nvme_get_prp_list(struct pci_epf_nvme *nvme, u64 prp,
 				     size_t mapping_size)
 {
-	struct pci_epf *epf = nvme->epf;
-	struct pci_epc_map map;
-	size_t prp_size;
+	struct pci_epf_nvme_seg seg;
 	int ret;
 
-	prp_size = min(pci_epf_nvme_prp_size(prp),
+	seg.pci_addr = prp;
+	seg.size = min(pci_epf_nvme_prp_size(prp),
 		       (mapping_size >> NVME_CTRL_PAGE_SHIFT) << 3);
-	ret = pci_epf_mem_map(epf, prp, prp_size, &map);
+
+	ret = pci_epf_nvme_transfer(nvme, &seg, DMA_FROM_DEVICE,
+				    nvme->prp_list_buf);
 	if (ret)
 		return ret;
 
-	memcpy_fromio(nvme->prp_list_buf, map.virt_addr, prp_size);
-
-	pci_epf_mem_unmap(epf, &map);
-
-	return prp_size >> 3;
+	return seg.size >> 3;
 }
 
 static int pci_epf_nvme_cmd_parse_prp_list(struct pci_epf_nvme *nvme,
