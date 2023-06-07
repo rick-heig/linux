@@ -780,20 +780,33 @@ pci_epf_nvme_fetch_cmd(struct pci_epf_nvme *nvme, int qid)
 }
 
 static int pci_epf_nvme_get_prp_list(struct pci_epf_nvme *nvme, u64 prp,
-				     size_t mapping_size)
+				     size_t btt)
 {
 	struct pci_epf_nvme_seg seg;
 	int ret;
 
 	seg.pci_addr = prp;
+	/* Compute the number of PRPs required for the number of bytes to
+	   transfer (BTT), if this number overflows the memory page size at
+	   the PRP given (PRP list pointer) only return the space available
+	   in the memory page, the last PRP in there will be a PRP list pointer
+	   to the rest of the PRPs.
+	   Note : The added page size - 1 is because BTT is not necessarily
+	   a multiple of the page size and the integer division would round the
+	   result down, resulting in an insufficient number of PRPs */
 	seg.size = min(pci_epf_nvme_prp_size(prp),
-		       (mapping_size >> NVME_CTRL_PAGE_SHIFT) << 3);
+		       ((btt + NVME_CTRL_PAGE_SIZE - 1) >>
+		        NVME_CTRL_PAGE_SHIFT) << 3);
+
+	dev_dbg(&nvme->epf->dev, "Get PRP list from: %#0llx, size: %zu, bytes to transfer: %zu\n",
+		 seg.pci_addr, seg.size, btt);
 
 	ret = pci_epf_nvme_transfer(nvme, &seg, DMA_FROM_DEVICE,
 				    nvme->prp_list_buf);
 	if (ret)
 		return ret;
 
+	/* Return the number of PRPs, size / sizeof(prp) which is 8 */
 	return seg.size >> 3;
 }
 
@@ -804,7 +817,7 @@ static int pci_epf_nvme_cmd_parse_prp_list(struct pci_epf_nvme *nvme,
 	struct nvme_command *cmd = &epcmd->cmd;
 	__le64 *prps = nvme->prp_list_buf;
 	struct pci_epf_nvme_seg *seg;
-	size_t size = 0, ofst, prp_size;
+	size_t size = 0, ofst, prp_size, btt;
 	int nr_segs, nr_prps = 0;
 	phys_addr_t pci_addr;
 	int i = 0, ret;
@@ -847,16 +860,15 @@ static int pci_epf_nvme_cmd_parse_prp_list(struct pci_epf_nvme *nvme,
 		goto invalid_field;
 
 	while (size < transfer_len) {
+		btt = transfer_len - size;
 
 		if (!nr_prps) {
 			/* Map the prp list */
-			nr_prps = pci_epf_nvme_get_prp_list(nvme, prp,
-						transfer_len + ofst - size);
+			nr_prps = pci_epf_nvme_get_prp_list(nvme, prp, btt);
 			if (nr_prps < 0)
 				goto internal;
 
 			i = 0;
-			ofst = 0;
 		}
 
 		/* Current entry */
@@ -864,8 +876,12 @@ static int pci_epf_nvme_cmd_parse_prp_list(struct pci_epf_nvme *nvme,
 		if (!prp)
 			goto invalid_field;
 
-		/* Did we reach the last prp entry of the list ? */
-		if (transfer_len - size > NVME_CTRL_PAGE_SIZE &&
+		/* Did we reach the last prp entry of the list ?
+		   Note : Here the actual parameter should be CC.MPS set by
+		   host, but since MPSMIN = MPSMAX = NVME_CTRL_PAGE_SIZE
+		   host can only set the page to NVME_CTRL_PAGE_SIZE but this
+		   could change in the future */
+		if (btt > NVME_CTRL_PAGE_SIZE &&
 		    i == nr_prps - 1) {
 			/* We need more PRPs: prp is a list pointer */
 			nr_prps = 0;
@@ -882,7 +898,7 @@ static int pci_epf_nvme_cmd_parse_prp_list(struct pci_epf_nvme *nvme,
 		   a multiple of PRP size so the crossing will happen when
 		   the next PRP is the start of a window (bits are 0) */
 		if (prp != pci_addr ||
-		    (pci_addr & (nvme->epc_features->window_size-1)) == 0) {
+		    (pci_addr & (nvme->epc_features->window_size - 1)) == 0) {
 			nr_segs++;
 			if (WARN_ON_ONCE(nr_segs > epcmd->nr_segs))
 				goto internal;
@@ -893,8 +909,7 @@ static int pci_epf_nvme_cmd_parse_prp_list(struct pci_epf_nvme *nvme,
 			pci_addr = prp;
 		}
 
-		prp_size = min_t(size_t, NVME_CTRL_PAGE_SIZE,
-				 transfer_len - size);
+		prp_size = min_t(size_t, NVME_CTRL_PAGE_SIZE, btt);
 		seg->size += prp_size;
 		pci_addr += prp_size;
 		size += prp_size;
