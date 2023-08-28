@@ -694,14 +694,18 @@ static void pci_epf_test_unbind(struct pci_epf *epf)
 {
 	struct pci_epf_test *epf_test = epf_get_drvdata(epf);
 	struct pci_epf_bar *epf_bar;
+	const struct pci_epc_features *epc_features;
 	int bar;
+
+	epc_features = epf_test->epc_features;
 
 	cancel_delayed_work_sync(&epf_test->cmd_handler);
 	pci_epf_test_clean_dma_chan(epf_test);
 	for (bar = 0; bar < PCI_STD_NUM_BARS; bar++) {
 		epf_bar = &epf->bar[bar];
 
-		if (epf_test->reg[bar]) {
+		if (epf_test->reg[bar] &&
+		    !(epc_features->fixed_bar & (1 << bar))) {
 			pci_epf_clear_bar(epf, epf_bar);
 			pci_epf_free_space(epf, epf_test->reg[bar], bar,
 					   PRIMARY_INTERFACE);
@@ -733,7 +737,11 @@ static int pci_epf_test_set_bar(struct pci_epf *epf)
 		if (!!(epc_features->reserved_bar & (1 << bar)))
 			continue;
 
+		if (!!(epc_features->fixed_bar & (1 << bar)))
+			continue;
+
 		ret = pci_epf_set_bar(epf, epf_bar);
+
 		if (ret) {
 			pci_epf_free_space(epf, epf_test->reg[bar], bar,
 					   PRIMARY_INTERFACE);
@@ -830,7 +838,7 @@ static int pci_epf_test_alloc_space(struct pci_epf *epf)
 	size_t pba_size = 0;
 	bool msix_capable;
 	void *base;
-	int bar, add;
+	int bar, add, ret;
 	enum pci_barno test_reg_bar = epf_test->test_reg_bar;
 	const struct pci_epc_features *epc_features;
 	size_t test_reg_size;
@@ -854,11 +862,22 @@ static int pci_epf_test_alloc_space(struct pci_epf *epf)
 		test_reg_size = bar_size[test_reg_bar];
 	}
 
-	base = pci_epf_alloc_space(epf, test_reg_size, test_reg_bar,
-				   epc_features->align, PRIMARY_INTERFACE);
-	if (!base) {
-		dev_err(dev, "Failed to allocated register space\n");
-		return -ENOMEM;
+	if (!!(epc_features->fixed_bar & (1 << test_reg_bar))) {
+		ret = pci_epc_get_fixed_bar(epf->epc, epf->func_no,
+					    epf->vfunc_no, test_reg_bar,
+					    &epf->bar[test_reg_bar]);
+		if (ret < 0) {
+			dev_err(dev, "Failed to get fixed bar");
+			return ret;
+		}
+		base = epf->bar[test_reg_bar].addr;
+	} else {
+		base = pci_epf_alloc_space(epf, test_reg_size, test_reg_bar,
+					   epc_features->align, PRIMARY_INTERFACE);
+		if (!base) {
+			dev_err(dev, "Failed to allocated register space\n");
+			return -ENOMEM;
+		}
 	}
 	epf_test->reg[test_reg_bar] = base;
 
@@ -872,9 +891,20 @@ static int pci_epf_test_alloc_space(struct pci_epf *epf)
 		if (!!(epc_features->reserved_bar & (1 << bar)))
 			continue;
 
-		base = pci_epf_alloc_space(epf, bar_size[bar], bar,
-					   epc_features->align,
-					   PRIMARY_INTERFACE);
+		if (!!(epc_features->fixed_bar & (1 << bar))) {
+			ret = pci_epc_get_fixed_bar(epf->epc, epf->func_no,
+						    epf->vfunc_no, bar,
+						    epf_bar);
+			if (ret < 0)
+				base = NULL;
+			else
+				base = epf->bar[bar].addr;
+		} else {
+			base = pci_epf_alloc_space(epf, bar_size[bar], bar,
+						   epc_features->align,
+						   PRIMARY_INTERFACE);
+		}
+
 		if (!base)
 			dev_err(dev, "Failed to allocate space for BAR%d\n",
 				bar);
