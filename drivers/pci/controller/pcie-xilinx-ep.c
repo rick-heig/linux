@@ -64,6 +64,7 @@ static struct pci_epc_features xilinx_pcie_epc_features = {
 		SZ_4K,
 		SZ_16M,
 	},
+	//.align = XILINX_PCIE_AT_SIZE_ALIGN, /** @todo get from DT */
 #if 0
 	/* BARs with fixed address translations */ /** @todo get from DT */
 	.bar_fixed_addr = {
@@ -131,6 +132,22 @@ static int xilinx_pcie_ep_get_fixed_bar(struct pci_epc *epc, u8 fn, u8 vfn,
 	/* This is fixed */
 	epf_bar->flags = PCI_BASE_ADDRESS_MEM_TYPE_32 |
 			 PCI_BASE_ADDRESS_SPACE_MEMORY;
+
+	return 0;
+}
+
+static int xilinx_pcie_ep_map_info(struct pci_epc *epc, u8 fn, u8 vfn,
+				   struct pci_epc_map *map)
+{
+	struct xilinx_pcie_ep *ep = epc_get_drvdata(epc);
+	phys_addr_t ofst, mask = ep->xilinx.window_size - 1;
+
+	ofst = map->pci_addr & mask;
+	if (ofst + map->size > ep->xilinx.window_size)
+		map->size = ep->xilinx.window_size - ofst;
+
+	map->phys_size = ALIGN(ofst + map->size, ep->xilinx.window_size);
+	map->phys_ofst = ofst;
 
 	return 0;
 }
@@ -276,6 +293,7 @@ static const struct pci_epc_ops xilinx_pcie_epc_ops = {
 	.set_bar	= NULL,
 	.clear_bar	= NULL,
 	.get_fixed_bar  = xilinx_pcie_ep_get_fixed_bar,
+	.map_info	= xilinx_pcie_ep_map_info,
 	.map_addr	= xilinx_pcie_ep_map_addr,
 	.unmap_addr	= xilinx_pcie_ep_unmap_addr,
 	/* Don't support MSI or MSI-X for the moment */
