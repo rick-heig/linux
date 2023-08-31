@@ -93,6 +93,9 @@ static int xilinx_pcie_ep_write_header(struct pci_epc *epc, u8 fn, u8 vfn,
 		dev_warn(xilinx->dev, "Cannot modify header, interface not provided\n");
 	}
 
+	dev_warn(xilinx->dev, "Cannot set class-code (baseclass, subclass, prog-if codes)"
+		              ", must be set in IP before gnerating bitstream\n");
+
 	return 0;
 }
 
@@ -126,8 +129,9 @@ static int xilinx_pcie_ep_get_fixed_bar(struct pci_epc *epc, u8 fn, u8 vfn,
 	/* This is fixed */
 	epf_bar->size = xilinx_pcie_epc_features.bar_fixed_size[epf_bar->barno];
 	/* Here we explicitely cast to a void* and drop the __iomem qualifier
-	 * because our architecture allows it and this code is not meant to be
-	 * ported to other architectures */
+	 * this is to be compatible with the current API, but actually it's
+	 * still iomem and should be used at such, e.g., unaligned 64-bit access
+	 * isn't possible */
 	epf_bar->addr = (void *)ioremap(epf_bar->phys_addr, epf_bar->size);
 	/* This is fixed */
 	epf_bar->flags = PCI_BASE_ADDRESS_MEM_TYPE_32 |
@@ -170,10 +174,10 @@ static int xilinx_pcie_ep_map_addr(struct pci_epc *epc, u8 fn, u8 vfn,
 	addr1 = upper_32_bits(pci_addr);
 	r = (addr - xilinx->mem_res->start) >> ilog2(xilinx->window_size);
 
-	dev_info(xilinx->dev, "Mapping phys addr : %pa\n", &addr);
-	dev_info(xilinx->dev, "pci addr : %#lx\n", pci_addr);
-	dev_info(xilinx->dev, "addr0 : %#x, addr1 : %#x\n", addr0, addr1);
-	dev_info(xilinx->dev, "r : %d\n", r);
+	//dev_info(xilinx->dev, "Mapping phys addr : %pa\n", &addr);
+	//dev_info(xilinx->dev, "pci addr : %#llx\n", pci_addr);
+	//dev_info(xilinx->dev, "addr0 : %#x, addr1 : %#x\n", addr0, addr1);
+	//dev_info(xilinx->dev, "r : %d\n", r);
 
 	/* PCI bus address region, upper comes first, see Xilinx PG194 */
 	writel(addr1, xilinx->reg_base +
