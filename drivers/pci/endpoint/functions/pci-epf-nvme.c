@@ -1891,6 +1891,9 @@ static int pci_epf_nvme_set_bars(struct pci_epf *epf)
 		if (features->reserved_bar & (1 << bar))
 			continue;
 
+		if (features->fixed_bar & (1 << bar))
+			continue;
+
 		ret = pci_epf_set_bar(epf, epf_bar);
 		if (ret) {
 			dev_err(&epf->dev, "Failed to set BAR%d\n", bar);
@@ -1911,6 +1914,8 @@ static int pci_epf_nvme_alloc_reg_bar(struct pci_epf *epf)
 	enum pci_barno reg_bar = epf_nvme->reg_bar;
 	size_t reg_size, reg_bar_size;
 	size_t msix_table_size = 0;
+	void *reg_base;
+	int ret;
 
 	/*
 	 * We want one MSI or MSIX per queue and are we want to keep queue
@@ -1962,13 +1967,30 @@ static int pci_epf_nvme_alloc_reg_bar(struct pci_epf *epf)
 		reg_bar_size = features->bar_fixed_size[reg_bar];
 	}
 
-	epf_nvme->reg[reg_bar] = pci_epf_alloc_space(epf, reg_bar_size, reg_bar,
-						PAGE_SIZE, PRIMARY_INTERFACE);
-	if (!epf_nvme->reg[reg_bar]) {
+	if (features->fixed_bar & (1 << reg_bar)) {
+		ret = pci_epc_get_fixed_bar(epf->epc, epf->func_no,
+					    epf->vfunc_no, reg_bar,
+					    &epf->bar[reg_bar]);
+		if (ret < 0) {
+			dev_err(&epf->dev, "Failed to get fixed bar");
+			return ret;
+		}
+		reg_base = epf->bar[reg_bar].addr;
+	} else {
+		reg_base = pci_epf_alloc_space(epf, reg_bar_size, reg_bar,
+					   PAGE_SIZE, PRIMARY_INTERFACE);
+	}
+
+	if (!reg_base) {
 		dev_err(&epf->dev, "Allocate register BAR failed\n");
 		return -ENOMEM;
 	}
-	memset(epf_nvme->reg[reg_bar], 0, reg_bar_size);
+
+	epf_nvme->reg[reg_bar] = reg_base;
+
+	//memset_io(epf_nvme->reg[reg_bar], 0, reg_bar_size);
+	/* Try clearing only 4k to see if it also fails */
+	memset_io(epf_nvme->reg[reg_bar], 0, min(reg_bar_size, (size_t)SZ_4K));
 
 	dev_dbg(&epf->dev,
 		"BAR %d, virt addr 0x%llx, phys addr 0x%llx, %zu B\n",
@@ -1985,6 +2007,7 @@ static int pci_epf_nvme_configure_bars(struct pci_epf *epf)
 	struct pci_epf_bar *epf_bar;
 	int bar, add, ret;
 	size_t bar_size;
+	void *base;
 
 	/* The first free BAR will be our register BAR */
 	bar = pci_epc_get_first_free_bar(features);
@@ -2021,15 +2044,29 @@ static int pci_epf_nvme_configure_bars(struct pci_epf *epf)
 		if (epf_nvme->reg[bar] || features->reserved_bar & (1 << bar))
 			continue;
 
-		bar_size = max_t(size_t, features->bar_fixed_size[bar], SZ_4K);
-		epf_nvme->reg[bar] = pci_epf_alloc_space(epf, bar_size, bar,
-						PAGE_SIZE, PRIMARY_INTERFACE);
-		if (!epf_nvme->reg[bar]) {
+		if (features->fixed_bar & (1 << bar)) {
+			ret = pci_epc_get_fixed_bar(epf->epc, epf->func_no,
+						    epf->vfunc_no, bar,
+						    epf_bar);
+			if (ret < 0)
+				base = NULL;
+			else
+				base = epf->bar[bar].addr;
+		} else {
+			bar_size = max_t(size_t, features->bar_fixed_size[bar], SZ_4K);
+			base = pci_epf_alloc_space(epf, bar_size, bar,
+					PAGE_SIZE, PRIMARY_INTERFACE);
+		}
+
+		if (!base) {
 			dev_err(&epf->dev, "Allocate BAR%d failed\n", bar);
 			return -ENOMEM;
 		}
 
-		memset(epf_nvme->reg[bar], 0, bar_size);
+		epf_nvme->reg[bar] = base;
+
+		/* Don't clear the other BARs for the moment */
+		//memset_io(epf_nvme->reg[bar], 0, bar_size);
 	}
 
 	return 0;
