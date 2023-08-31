@@ -17,11 +17,17 @@
 #include <linux/pci_regs.h>
 #include <linux/io-64-nonatomic-lo-hi.h>
 #include <linux/nvme.h>
+#include <linux/list.h>
 #include <generated/utsrelease.h>
 
 #include "../../../nvme/host/nvme.h"
 #include "../../../nvme/host/fabrics.h"
 #include "../../../nvme/target/nvmet.h"
+
+/*
+ * To test the no wait version for submitting commands
+ */
+#define PCI_EPF_NVME_TEST_CMD_NOWAIT 0
 
 /*
  * Maximum data transfer size: limit to 128 KB to avoid excessive local
@@ -124,6 +130,7 @@ struct pci_epf_nvme_cmd {
 	struct nvme_command 		cmd;
 	struct nvme_completion		cqe;
 	struct completion		done;
+	struct list_head		list_node;
 
 	/* Internal buffer that we will transfer over PCI */
 	size_t				buffer_size;
@@ -169,6 +176,8 @@ struct pci_epf_nvme {
 	struct delayed_work		sq_poll;
 
 	unsigned int			max_nr_queues;
+
+	struct list_head		deferred_reqs;
 
 	struct pci_epf_nvme_ctrl	ctrl;
 
@@ -1397,9 +1406,77 @@ static void pci_epf_nvme_enable_ctrl(struct pci_epf_nvme *epf_nvme)
 	return;
 }
 
+static enum rq_end_io_ret pci_epf_nvme_cmd_done(struct request *req,
+						blk_status_t blk_status)
+{
+	struct pci_epf_nvme_cmd *epcmd = req->end_io_data;
+
+	epcmd->status = nvme_req(req)->status;
+	blk_mq_free_request(req);
+	complete(&epcmd->done);
+	return RQ_END_IO_NONE;
+}
+
+static int pci_epf_nvme_submit_cmd_nowait(struct pci_epf_nvme *epf_nvme,
+					  struct pci_epf_nvme_cmd *epcmd)
+{
+	struct nvme_command *cmd = &epcmd->cmd;
+	struct request_queue *q;
+	struct request *req;
+	void *buffer = epcmd->buffer;
+	unsigned bufflen = epcmd->buffer_size;
+	int ret;
+
+	if (epcmd->ns)
+		q = epcmd->ns->queue;
+	else
+		q = epf_nvme->ctrl.ctrl->admin_q;
+
+	/**
+	 * @todo timeout ?
+	 * @note code inspired by __nvme_submit_sync_cmd() in drivers/nvme/host/core.c
+	 * and nvmet_passthru_execute_cmd() in drivers/nvme/target/passthru.c
+	 */
+
+	req = blk_mq_alloc_request(q, nvme_req_op(cmd), 0);
+
+	if (IS_ERR(req))
+		return PTR_ERR(req);
+	nvme_init_request(req, cmd);
+
+	if (buffer && bufflen) {
+		ret = blk_rq_map_kern(q, req, buffer, bufflen, GFP_KERNEL);
+		if (ret)
+			goto out;
+	}
+
+//	if (timeout)
+//		req->timeout = timeout;
+
+	req->end_io = pci_epf_nvme_cmd_done;
+	req->end_io_data = epcmd;
+	blk_execute_rq_nowait(req, false);
+
+	return 0;
+
+out:
+	epcmd->status = NVME_SC_INTERNAL | NVME_SC_DNR;
+	blk_mq_free_request(req);
+	return ret;
+}
+
 static void pci_epf_nvme_submit_sync_cmd(struct pci_epf_nvme *epf_nvme,
 					 struct pci_epf_nvme_cmd *epcmd)
 {
+#if PCI_EPF_NVME_TEST_CMD_NOWAIT
+	int ret;
+	// Test the new mechanism in a sequential manner
+	ret = pci_epf_nvme_submit_cmd_nowait(epf_nvme, epcmd);
+	if (ret < 0)
+		epcmd->status = NVME_SC_INTERNAL | NVME_SC_DNR;
+	else
+		wait_for_completion(&epcmd->done);
+#else
 	struct nvme_command *cmd = &epcmd->cmd;
 	struct request_queue *q;
 	int ret;
@@ -1414,12 +1491,25 @@ static void pci_epf_nvme_submit_sync_cmd(struct pci_epf_nvme *epf_nvme,
 		epcmd->status = NVME_SC_INTERNAL | NVME_SC_DNR;
 	else if (ret > 0)
 		epcmd->status = ret;
-
+#endif
 	if (epcmd->status)
 		dev_err(&epcmd->epf_nvme->epf->dev,
 			"QID %d: command %s (0x%x) failed, status 0x%0x\n",
 			epcmd->cqid, pci_epf_nvme_cmd_name(epcmd),
 			epcmd->cmd.common.opcode, epcmd->status);
+}
+
+static inline void pci_epf_nvme_submit_cmd(struct pci_epf_nvme *epf_nvme,
+				    struct pci_epf_nvme_cmd *epcmd,
+				    bool deferred)
+{
+	if (deferred) {
+		list_add_tail(&epcmd->list_node,
+			      &epcmd->epf_nvme->deferred_reqs);
+		pci_epf_nvme_submit_cmd_nowait(epf_nvme, epcmd);
+	}
+	else
+		pci_epf_nvme_submit_sync_cmd(epf_nvme, epcmd);
 }
 
 static void pci_epf_nvme_admin_create_cq(struct pci_epf_nvme *epf_nvme,
@@ -1596,7 +1686,7 @@ static bool pci_epf_nvme_process_admin_cmd(struct pci_epf_nvme *epf_nvme)
 			goto complete;
 	}
 
-	pci_epf_nvme_submit_sync_cmd(epf_nvme, epcmd);
+	pci_epf_nvme_submit_cmd(epf_nvme, epcmd, false);
 
 	/* Command done: post process it and transfer data if needed */
 	if (post_process_hook)
@@ -1621,6 +1711,7 @@ static bool pci_epf_nvme_process_io_cmd(struct pci_epf_nvme *epf_nvme, int qid)
 	enum dma_data_direction dir = DMA_NONE;
 	struct pci_epf_nvme_cmd *epcmd;
 	size_t transfer_len = 0;
+	bool deferred = false;
 	int ret;
 
 	/* Fetch new command from IO submission queue */
@@ -1645,6 +1736,7 @@ static bool pci_epf_nvme_process_io_cmd(struct pci_epf_nvme *epf_nvme, int qid)
 	case nvme_cmd_write:
 		transfer_len = pci_epf_nvme_rw_data_len(epcmd);
 		dir = DMA_FROM_DEVICE;
+		deferred = true;
 		break;
 
 	case nvme_cmd_dsm:
@@ -1681,16 +1773,37 @@ static bool pci_epf_nvme_process_io_cmd(struct pci_epf_nvme *epf_nvme, int qid)
 		}
 	}
 
-	pci_epf_nvme_submit_sync_cmd(epf_nvme, epcmd);
+	pci_epf_nvme_submit_cmd(epf_nvme, epcmd, deferred);
 
 	/* Transfer command data to the host */
 	if (transfer_len && dir == DMA_TO_DEVICE)
 		pci_epf_nvme_cmd_transfer(epf_nvme, epcmd, dir);
 
 complete:
-	pci_epf_nvme_queue_response(epcmd);
+	if (!deferred)
+		pci_epf_nvme_queue_response(epcmd);
 
 	return true;
+}
+
+static void pci_epf_nvme_chk_deferred_completions(struct pci_epf_nvme* epf_nvme)
+{
+	struct pci_epf_nvme_cmd *epcmd;
+	struct pci_epf_nvme_cmd *epcmd_tmp;
+	bool completed;
+
+	list_for_each_entry_safe(epcmd, epcmd_tmp, &epf_nvme->deferred_reqs,
+				 list_node) {
+		completed = try_wait_for_completion(&epcmd->done);
+		if (completed) {
+			/*
+			 * Delete because pci_epf_nvme_queue_response frees
+			 * epcmd
+			 */
+			list_del(&epcmd->list_node);
+			pci_epf_nvme_queue_response(epcmd);
+		}
+	}
 }
 
 static void pci_epf_nvme_sq_poll(struct work_struct *work)
@@ -1708,6 +1821,8 @@ static void pci_epf_nvme_sq_poll(struct work_struct *work)
 			did_work |= pci_epf_nvme_process_io_cmd(epf_nvme, qid);
 		did_work |= pci_epf_nvme_process_admin_cmd(epf_nvme);
 	}
+
+	pci_epf_nvme_chk_deferred_completions(epf_nvme);
 
 	if (!pci_epf_nvme_ctrl_ready(ctrl))
 		return;
@@ -2116,6 +2231,9 @@ static int pci_epf_nvme_probe(struct pci_epf *epf,
 	epf_nvme->epf = epf;
 	INIT_DELAYED_WORK(&epf_nvme->reg_poll, pci_epf_nvme_reg_poll);
 	INIT_DELAYED_WORK(&epf_nvme->sq_poll, pci_epf_nvme_sq_poll);
+
+	dev_info(&epf_nvme->epf->dev, "Version with deferred REQs\n");
+	INIT_LIST_HEAD(&epf_nvme->deferred_reqs);
 
 	epf_nvme->prp_list_buf = devm_kzalloc(&epf->dev, NVME_CTRL_PAGE_SIZE,
 					      GFP_KERNEL);
