@@ -52,6 +52,14 @@
  */
 #define PCI_EPF_NVME_MIN_POLL_DELAY_US 50
 
+#define CMB_PAGE_SHIFT			12
+#define CMB_PAGE_SIZE			(1 << CMB_PAGE_SHIFT)
+#define CMB_BIR_MASK			0x7
+#define CMB_BIR				2
+#define CMBMSC_CRE_BIT			(1 << 0)
+#define CMBMSC_CMSE_BIT			(1 << 1)
+#define CMBMSC_CBA_MASK			GENMASK(63, 12)
+
 /*
  * Maximum data transfer size: limit to 128 KB to avoid excessive local
  * memory use for buffers.
@@ -145,6 +153,8 @@ struct pci_epf_nvme_ctrl {
 	u32				aqa;
 	u64				asq;
 	u64				acq;
+	u32				cmbloc;
+	u32				cmbsz;
 
 	size_t				adm_sqes;
 	size_t				adm_cqes;
@@ -573,6 +583,96 @@ static int pci_epf_nvme_mmio_transfer(struct pci_epf_nvme *nvme,
 	}
 }
 
+static void pci_epf_nvme_print_cmb_info(struct pci_epf_nvme *epf_nvme)
+{
+	u64 cmbmsc;
+	phys_addr_t cba;
+	const size_t CMB_SIZE = epf_nvme->epf->bar[CMB_BIR].size;
+
+	cmbmsc = pci_epf_nvme_reg_read64(&epf_nvme->ctrl, NVME_REG_CMBMSC);
+	cba = cmbmsc & CMBMSC_CBA_MASK;
+
+	dev_info(&epf_nvme->epf->dev,
+		 "CMB phys addr: %#0llx end: %#0llx CMSE %sabled CRE %sabled\n",
+		 cba, cba + CMB_SIZE,
+		 ((cmbmsc & CMBMSC_CMSE_BIT) ? "en" : "dis"),
+		 ((cmbmsc & CMBMSC_CRE_BIT) ? "en" : "dis"));
+}
+
+static int pci_epf_nvme_addr_in_cmb(struct pci_epf_nvme *epf_nvme,
+				    phys_addr_t addr)
+{
+	u64 cmbmsc;
+	phys_addr_t cba;
+	const size_t CMB_SIZE = epf_nvme->epf->bar[CMB_BIR].size;
+
+	cmbmsc = pci_epf_nvme_reg_read64(&epf_nvme->ctrl, NVME_REG_CMBMSC);
+	cba = cmbmsc & CMBMSC_CBA_MASK;
+
+	/* If Controller Memory Space Enabled and Capabilities Register Enabled */
+	if (!!(cmbmsc & CMBMSC_CMSE_BIT) && !!(cmbmsc & CMBMSC_CRE_BIT)) {
+		/* If the PCI addr is in the CMB */
+		if (addr >= cba && addr < (cba + CMB_SIZE)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+/* The address must be in the CMB, there is no check here */
+static void *pci_epf_nvme_cmb_addr_as_local_addr(struct pci_epf_nvme *epf_nvme,
+						 phys_addr_t addr)
+{
+	u64 cmbmsc;
+	phys_addr_t cba, offset;
+
+	cmbmsc = pci_epf_nvme_reg_read64(&epf_nvme->ctrl, NVME_REG_CMBMSC);
+	cba = cmbmsc & CMBMSC_CBA_MASK;
+	offset = addr - cba;
+
+	return (char*)(epf_nvme->reg[CMB_BIR]) + offset;
+}
+
+static int pci_epf_nvme_segment_in_cmb(struct pci_epf_nvme *epf_nvme,
+				       struct pci_epf_nvme_segment *seg)
+{
+	return pci_epf_nvme_addr_in_cmb(epf_nvme, seg->pci_addr);
+}
+
+static int pci_epf_nvme_map_cmb_segment(struct pci_epf_nvme *epf_nvme,
+					struct pci_epf_nvme_segment *seg,
+					struct pci_epc_map *map)
+{
+	u64 cmbmsc;
+	phys_addr_t cba, offset;
+	const size_t CMB_SIZE = epf_nvme->epf->bar[CMB_BIR].size;
+
+	if (!seg | !map | !seg->size)
+		return -EINVAL;
+
+	cmbmsc = pci_epf_nvme_reg_read64(&epf_nvme->ctrl, NVME_REG_CMBMSC);
+	cba = cmbmsc & CMBMSC_CBA_MASK;
+	offset = seg->pci_addr - cba;
+
+	if (seg->pci_addr < cba ||
+	    seg->pci_addr > (cba + CMB_SIZE)) {
+		dev_err(&epf_nvme->epf->dev, "Segment not in CMB");
+		return -EINVAL;
+	}
+
+	if (seg->pci_addr + seg->size > cba + CMB_SIZE) {
+		dev_err(&epf_nvme->epf->dev, "Segment overflows CMB\n");
+		return -ENOMEM;
+	}
+
+	map->pci_addr = seg->pci_addr;
+	map->phys_size = seg->size;
+	map->phys_addr = epf_nvme->epf->bar[CMB_BIR].phys_addr + offset;
+	map->virt_addr = (char*)(epf_nvme->reg[CMB_BIR]) + offset;
+
+	return 0;
+}
+
 static int pci_epf_nvme_transfer(struct pci_epf_nvme_xfer_thread *xfer_thread,
 				 struct pci_epf_nvme_segment *seg,
 				 enum dma_data_direction dir, void *buf,
@@ -593,6 +693,19 @@ static int pci_epf_nvme_transfer(struct pci_epf_nvme_xfer_thread *xfer_thread,
 		map_size = pci_epf_mem_map(epf, addr, size, &map);
 		if (map_size < 0)
 			return map_size;
+
+		/* If we have to read/write our own CMB we do not do it through
+		 * PCI so the map is different based on CMB/PCI */
+		if (pci_epf_nvme_segment_in_cmb(epf_nvme, seg)) {
+			ret = pci_epf_nvme_map_cmb_segment(epf_nvme, seg, &map);
+			if (ret)
+				return ret;
+			map_size = seg->size;
+		} else {
+			map_size = pci_epf_mem_map(epf, addr, size, &map);
+			if (map_size < 0)
+				return map_size;
+		}
 
 		/* Do not bother with DMA for small transfers */
 		if (no_dma || !xfer_thread->dma.dma_supported ||
@@ -1592,8 +1705,15 @@ static void pci_epf_nvme_init_ctrl_regs(struct pci_epf_nvme *epf_nvme)
 	/* Clear Persistent Memory Region Supported (PMRS) */
 	ctrl->cap &= ~(0x1ULL << 56);
 
-	/* Clear Controller Memory Buffer Supported (CMBS) */
-	ctrl->cap &= ~(0x1ULL << 57);
+	/* Controller Memory Buffer Supported (CMBS) */
+	ctrl->cap |= (0x1ULL << 57);
+	ctrl->cmbloc = CMB_BIR;
+	/* Controller Memory Buffer Size (CMB page 4kB when SZU set to 0) */
+	ctrl->cmbsz = (epf_nvme->epf->bar[CMB_BIR].size >> CMB_PAGE_SHIFT) << 12;
+	ctrl->cmbsz |= 1 << 4; /* WDS */
+	ctrl->cmbsz |= 1 << 3; /* RDS */
+	pci_epf_nvme_reg_write32(ctrl, NVME_REG_CMBLOC, ctrl->cmbloc);
+	pci_epf_nvme_reg_write32(ctrl, NVME_REG_CMBSZ, ctrl->cmbsz);
 
 	/* NVMe version supported */
 	ctrl->vs = ctrl->ctrl->vs;
