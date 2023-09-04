@@ -22,6 +22,7 @@
 #include <linux/spinlock.h>
 #include <linux/atomic.h>
 #include <linux/kthread.h>
+#include <net/sock.h>
 #include <generated/utsrelease.h>
 
 #include "../../../nvme/host/nvme.h"
@@ -59,6 +60,383 @@
 #define CMBMSC_CRE_BIT			(1 << 0)
 #define CMBMSC_CMSE_BIT			(1 << 1)
 #define CMBMSC_CBA_MASK			GENMASK(63, 12)
+
+/* Network relay related below */
+#define TSP_RELAY_BUFFER_SIZE (SZ_4K - sizeof(u32))
+#define TSP_RELAY_MAX_RELAYS 4
+
+struct tsp_relay {
+	struct socket		*socket;
+	struct task_struct	*thread;
+	DECLARE_KFIFO_PTR(fifo, typeof(struct pci_epf_nvme_cmd *));
+	bool			shutdown;
+	struct wait_queue_head	wq;
+};
+
+struct pci_epf_nvme;
+
+struct tsp_relay_thread_args {
+	struct pci_epf_nvme	*nvme;
+	int			relay_desc;
+};
+
+struct __attribute__((packed)) addr_info {
+	char	node[256];
+	char	service[256];
+	//s32	flags;
+	//s32	family;
+	//s32	socktype;
+	//s32	protocol
+};
+
+/* Local Memory Management */
+typedef struct LinkedList_t {
+    size_t size;
+    void *ptr;
+    struct LinkedList_t *prev;
+    struct LinkedList_t *next;
+    int used;
+} LinkedList_t;
+
+typedef struct Context_t {
+    void *base_address;
+    size_t size;
+    size_t used;
+    LinkedList_t *head;
+} Context_t;
+
+#define CONTEXT(ctx) ((Context_t*)ctx)
+
+int tsp_mm_init_context(void *memory_region, size_t memory_region_size, void **opaque_p) {
+	Context_t *ctx;
+
+	if (!opaque_p) {
+		return -EINVAL;
+	}
+
+	*opaque_p = kmalloc(sizeof(Context_t), GFP_USER);
+	if (!*opaque_p) {
+		return -ENOMEM;
+	}
+
+	ctx = CONTEXT(*opaque_p);
+	ctx->base_address = memory_region;
+	ctx->size = memory_region_size;
+	ctx->used = 0;
+
+	ctx->head = kmalloc(sizeof(LinkedList_t), GFP_USER);
+	if (!ctx->head) {
+		kfree(*opaque_p);
+		*opaque_p = NULL;
+		return -ENOMEM;
+	}
+
+	ctx->head->size = memory_region_size;
+	ctx->head->ptr = memory_region;
+	ctx->head->next = NULL;
+	ctx->head->prev = NULL;
+	ctx->head->used = 0;
+
+	return 0;
+}
+
+static void *_reserve(size_t size, LinkedList_t* ll, Context_t* ctx) {
+	LinkedList_t *next, *new;
+	size_t total_size;
+
+	total_size = ll->size;
+	next = ll->next;
+
+	// Update linked list
+	ll->size = size;
+
+	// Split linked list if not exact allocation
+	if (size != total_size) {
+		new = kmalloc(sizeof(LinkedList_t), GFP_USER);
+		if (!new)
+			return NULL;
+
+		ll->next = new;
+
+		new->prev = ll;
+		new->size = total_size - size;
+		new->ptr = (void *)((char *)ll->ptr + size);
+		new->next = next;
+		if (next) {
+			next->prev = new;
+		}
+		new->used = 0;
+	}
+
+	// Block is now used (reserved)
+	ll->used = 1;
+	ctx->used += size;
+	return ll->ptr;
+}
+
+void *tsp_mm_alloc(size_t size, void *opaque) {
+	Context_t *ctx;
+	LinkedList_t *ll;
+
+	if (!opaque)
+		return NULL;
+	if (!size)
+		return NULL;
+	ctx = CONTEXT(opaque);
+
+	ll = ctx->head;
+	while(ll) {
+		if (!ll->used && (ll->size >= size)) {
+			return _reserve(size, ll, ctx);
+		} else {
+			ll = ll->next;
+		}
+	}
+
+	return NULL; // Cannot fit
+}
+
+static void _try_merge_next(LinkedList_t *ll) {
+	LinkedList_t *next;
+	next = ll->next;
+
+	if (next && !next->used) {
+		// Merge next into current
+		ll->size += next->size;
+		ll->next = next->next;
+		if (next->next) {
+			next->next->prev = ll;
+		}
+		kfree(next); // Block disapears
+	}
+}
+
+static void _unreserve(LinkedList_t *ll, Context_t *ctx) {
+	ll->used = 0;
+	ctx->used -= ll->size;
+
+	_try_merge_next(ll);
+
+	// If previous block is unused merge it into current block
+	if (ll->prev && !ll->prev->used) {
+		_try_merge_next(ll->prev);
+		// ll is not necessarily a valid ptr anymore here
+	}
+}
+
+static void tsp_mm_free(void *ptr, void *opaque) {
+	Context_t *ctx;
+	LinkedList_t *ll;
+
+	if (!opaque)
+		return;
+
+	ctx = CONTEXT(opaque);
+
+	ll = ctx->head;
+
+	// Search entry
+	while(ll && ll->ptr != ptr) {
+		ll = ll->next;
+	}
+
+	if (ll && ll->used) {
+		_unreserve(ll, ctx);
+		// ll is not necessarily a valid ptr anymore here
+	} else {
+		// Should not happen
+		pr_err("TSP Memory Management Pointer %#llx was not allocated... cannot free\n", (phys_addr_t)ptr);
+	}
+}
+
+static void mm_quit_context(void *opaque) {
+	Context_t *ctx;
+	LinkedList_t *ll;
+
+	if (!opaque)
+		return;
+
+	ctx = CONTEXT(opaque);
+
+	ll = ctx->head;
+	while(ll) {
+		LinkedList_t *to_be_freed = ll;
+		ll = ll->next;
+		kfree(to_be_freed);
+	}
+
+	kfree(ctx);
+}
+
+#ifndef __TSP_CS_H__
+#define __TSP_CS_H__
+
+typedef struct __attribute__((packed)) CSEProperties {
+	u16 HwVersion;
+	u16 SwVersion;
+	char UniqueName[32];     // an identifiable string for this CSE
+	u16 NumBuiltinFunctions; // number of available preloaded functions
+	u32 MaxRequestsPerBatch; // maximum number of requests supported per batch request
+	u32 MaxFunctionParametersAllows;    // maximum number of parameters supported
+	u32 MaxConcurrentFunctionInstances; // maximum number of function instances supported
+} CSEProperties;
+
+typedef struct __attribute__((packed)) CSxProperties {
+	u16 HwVersion;         // specifies the hardware version of this CSx
+	u16 SwVersion;         // specifies the software version that runs on this CSx
+	u16 VendorId;          // specifies the vendor id of this CSx
+	u16 DeviceId;          // specifies the device id of this CSx
+	char FriendlyName[32];      // an identifiable string for this CSx
+	u32 CFMinMB;           // Amount of CFM in megabytes installed in device
+	u32 FDMinMB;           // amount of FDM in megabytes installed in device
+	struct __attribute__((packed)) {
+		u64 FDMIsDeviceManaged : 1;     // FDM allocations managed by device
+		u64 FDMIsHostVisible : 1;       // FDM may be mapped to host address space
+		u64 BatchRequestsSupported : 1; // CSx supports batch requests in hardware
+		u64 StreamsSupported : 1;       // CSx supports streams in hardware
+		u64 Reserved : 60;
+	} Flags;
+	u16 NumCSEs;
+	CSEProperties CSE[1];  // see 6.3.4.1.14
+} CSxProperties;
+
+typedef struct __attribute__((packed)) CsCapabilities {
+	// specifies the fixed functionality device capability
+	struct __attribute__((packed)) {
+		u64 Compression : 1;
+		u64 Decompression : 1;
+		u64 Encryption : 1;
+		u64 Decryption : 1;
+		u64 RAID : 1;
+		u64 EC : 1;
+		u64 Dedup : 1;
+		u64 Hash : 1;
+		u64 Checksum : 1;
+		u64 RegEx : 1;
+		u64 DbFilter : 1;
+		u64 ImageEncode : 1;
+		u64 VideoEncode : 1;
+		u64 CustomType : 48;
+	} Functions;
+} CsCapabilities;
+
+typedef CsCapabilities CsFunctionBitSelect;
+
+typedef enum {
+	CS_AFDM_TYPE = 1,
+	CS_32BIT_VALUE_TYPE = 2,
+	CS_64BIT_VALUE_TYPE = 3,
+	// https://stackoverflow.com/questions/35380279/avoid-name-collisions-with-enum-in-c-c99
+	// Added _ to avoid collision with struct CS_STREAM_TYPE below
+	CS_STREAM_TYPE_ = 4,
+	CS_DESCRIPTOR_TYPE = 5
+} CS_COMPUTE_ARG_TYPE;
+
+typedef struct {
+	void *MemHandle;  // an opaque memory handle for AFDM
+	unsigned long ByteOffset; // denotes the offset with AFDM
+} __attribute__((packed)) CsDevAFDM;
+
+typedef void* CS_STREAM_HANDLE;
+typedef s32 CS_CSE_HANDLE;
+typedef u32 CS_FUNCTION_ID;
+
+typedef struct {
+	CS_COMPUTE_ARG_TYPE Type;
+	union {
+		CsDevAFDM DevMem;  // see 6.3.4.2.1
+		u64 Value64;
+		u32 Value32;
+		CS_STREAM_HANDLE StreamHandle;
+	} u;
+} __attribute__((packed)) CsComputeArg;
+
+typedef struct {
+	CS_CSE_HANDLE CSEHandle;
+	CS_FUNCTION_ID FunctionId;
+	int NumArgs;               // set to total arguments to CSF
+	CsComputeArg Args[1];      // see 6.3.4.2.6
+			       // allocate enough space past this for multiple
+			       // arguments
+} __attribute__((packed)) CsComputeRequest;
+
+typedef enum {
+	TSP_CS_IDENTIFY = 0,
+	TSP_CS_GET = 8,
+	TSP_CS_ALLOCATE = 16,
+	TSP_CS_DEALLOCATE = 17,
+	TSP_CS_COMPUTE = 32,
+} TSP_CDW10;
+
+typedef enum {
+	TSP_CS_CSX = 0,
+	TSP_CS_PROPS = 8,
+	TSP_CS_CAPS = 16,
+	TSP_CS_FUN = 32,
+	TSP_CS_MEM = 64,
+	TSP_CS_COMM = 64,
+	TSP_CS_OPEN_RELAY = 128,
+	TSP_CS_CLOSE_RELAY = 129,
+} TSP_CDW11;
+
+enum {
+	TSP_CHECKSUM_FUNCTION_ID = 42,
+	TSP_SLEEP_FUNCTION_ID = 100,
+};
+
+typedef struct AsyncComputeRequest {
+	struct pci_epf_nvme *nvme;
+	struct pci_epf_nvme_cmd *epcmd;
+	CsComputeRequest *creq;
+	size_t creq_size;
+} AsyncComputeRequest;
+
+#endif /* __TSP_CS_H__ */
+
+static CSEProperties tsp_cse_props = {
+	.HwVersion = 0x1,
+	.SwVersion = 0x1,
+	.UniqueName = "CSE Number 1",
+	.NumBuiltinFunctions = 1,
+	.MaxRequestsPerBatch = 1,
+	.MaxFunctionParametersAllows = 4,
+	.MaxConcurrentFunctionInstances = 1,
+};
+
+static CSxProperties tsp_csx_props = {
+	.HwVersion = 0x1,
+	.SwVersion = 0x1,
+	.VendorId = 0x42,
+	.DeviceId = 0x1337,
+	.FriendlyName = "Friendly CSX",
+	.CFMinMB = 0,
+	.FDMinMB = 0,
+	.Flags.FDMIsDeviceManaged = 1,
+	.Flags.FDMIsHostVisible = 0,
+	.Flags.BatchRequestsSupported = 0,
+	.Flags.StreamsSupported = 0,
+	.Flags.Reserved = 0,
+	.NumCSEs = 1,
+};
+
+static CsCapabilities tsp_cs_caps = {
+	.Functions.Compression = 0,
+	.Functions.Decompression = 0,
+	.Functions.Encryption = 0,
+	.Functions.Decryption = 0,
+	.Functions.RAID = 0,
+	.Functions.EC = 0,
+	.Functions.Dedup = 0,
+	.Functions.Hash = 0,
+	.Functions.Checksum = 1,
+	.Functions.RegEx = 0,
+	.Functions.DbFilter = 0,
+	.Functions.ImageEncode = 0,
+	.Functions.VideoEncode = 0,
+	.Functions.CustomType = 0,
+};
+
+static const char *TSP_CS_ID_STRING = "This device has compute";
 
 /*
  * Maximum data transfer size: limit to 128 KB to avoid excessive local
@@ -98,6 +476,7 @@ enum destination {
 	pci_epf_nvme_to_complete = 0,
 	pci_epf_nvme_to_transfer,
 	pci_epf_nvme_to_backend,
+	pci_epf_nvme_to_read_relay,
 };
 
 /*
@@ -238,6 +617,11 @@ struct pci_epf_nvme_cmd {
 	__u8				path[MAX_PATH_LEN];
 	size_t				transfer_len;
 
+	/* Compute thread */
+	struct task_struct		*thread;
+	/* Relay */
+	int				relay_desc;
+
 	/* Internal buffer that we will transfer over PCI */
 	size_t				buffer_size;
 	void				*buffer;
@@ -271,6 +655,7 @@ struct pci_epf_nvme {
 	struct delayed_work		reg_poll;
 	struct delayed_work		sq_poll;
 
+	struct pci_epf_nvme_xfer_thread sq_xfer_info;
 	struct pci_epf_nvme_xfer_thread *xfer_threads;
 	spinlock_t			xfer_fifo_wr_lock;
 	spinlock_t			xfer_fifo_rd_lock;
@@ -292,6 +677,10 @@ struct pci_epf_nvme {
 	struct config_group		group;
 	char				*ctrl_opts_buf;
 	bool				dma_enable;
+
+	/* Towards Storage Processing (TSP) */
+	void				*tsp_alloc_ctx;
+	struct tsp_relay		*tsp_relays[TSP_RELAY_MAX_RELAYS];
 };
 
 /*
@@ -685,18 +1074,14 @@ static int pci_epf_nvme_transfer(struct pci_epf_nvme_xfer_thread *xfer_thread,
 	size_t size = seg->size;
 	struct pci_epc_map map;
 	ssize_t map_size;
+	bool in_cmb = pci_epf_nvme_segment_in_cmb(epf_nvme, seg);
 	int ret;
 
 	while (size) {
 
-		/* Map segment */
-		map_size = pci_epf_mem_map(epf, addr, size, &map);
-		if (map_size < 0)
-			return map_size;
-
 		/* If we have to read/write our own CMB we do not do it through
 		 * PCI so the map is different based on CMB/PCI */
-		if (pci_epf_nvme_segment_in_cmb(epf_nvme, seg)) {
+		if (in_cmb) {
 			ret = pci_epf_nvme_map_cmb_segment(epf_nvme, seg, &map);
 			if (ret)
 				return ret;
@@ -717,7 +1102,8 @@ static int pci_epf_nvme_transfer(struct pci_epf_nvme_xfer_thread *xfer_thread,
 							&xfer_thread->dma,
 							&map, buf, dir);
 
-		pci_epf_mem_unmap(epf, &map);
+		if (!in_cmb)
+			pci_epf_mem_unmap(epf, &map);
 
 		if (ret)
 			return ret;
@@ -748,6 +1134,7 @@ static void pci_epf_nvme_init_cmd(struct pci_epf_nvme *epf_nvme,
 	epcmd->status = NVME_SC_SUCCESS;
 	epcmd->ts.creation = ktime_get_ns();
 	/* next_destination, path, set to 0 by memset */
+	/* compute thread and relay info are set to 0 by memset */
 }
 
 static int pci_epf_nvme_alloc_cmd_buffer(struct pci_epf_nvme_cmd *epcmd)
@@ -843,7 +1230,7 @@ static const char *pci_epf_nvme_cmd_name(struct pci_epf_nvme_cmd *epcmd)
 static int pci_epf_nvme_cmd_transfer(struct pci_epf_nvme_cmd *epcmd)
 {
 	struct pci_epf_nvme_xfer_thread *xfer_thread = epcmd->xfer_thread;
-	struct pci_epf_nvme *epf_nvme = xfer_thread->epf_nvme;
+	struct pci_epf_nvme *epf_nvme = epcmd->epf_nvme;
 	struct pci_epf_nvme_segment *seg;
 	void *buf = epcmd->buffer;
 	enum dma_data_direction dir = epcmd->dir;
@@ -911,12 +1298,21 @@ static inline void pci_epf_nvme_set_bxc_path(struct pci_epf_nvme_cmd *epcmd)
 	epcmd->path[2] = pci_epf_nvme_to_complete;
 }
 
+static inline void pci_epf_nvme_set_rxc_path(struct pci_epf_nvme_cmd *epcmd)
+{
+	epcmd->path[0] = pci_epf_nvme_to_read_relay;
+	epcmd->path[1] = pci_epf_nvme_to_transfer;
+	epcmd->path[2] = pci_epf_nvme_to_complete;
+}
+
 static inline
 void pci_epf_nvme_send_cmd_to_completion(struct pci_epf_nvme_cmd *epcmd);
 static inline
 void pci_epf_nvme_send_cmd_to_backend(struct pci_epf_nvme_cmd *epcmd);
 static inline
 void pci_epf_nvme_send_cmd_to_xfer(struct pci_epf_nvme_cmd *epcmd);
+static inline
+void tsp_nvme_cmd_to_read_relay(struct pci_epf_nvme_cmd *epcmd);
 
 static inline
 void pci_epf_nvme_send_cmd_to_next(struct pci_epf_nvme_cmd *epcmd)
@@ -930,6 +1326,9 @@ void pci_epf_nvme_send_cmd_to_next(struct pci_epf_nvme_cmd *epcmd)
 		break;
 	case pci_epf_nvme_to_backend:
 		pci_epf_nvme_send_cmd_to_backend(epcmd);
+		break;
+	case pci_epf_nvme_to_read_relay:
+		tsp_nvme_cmd_to_read_relay(epcmd);
 		break;
 	default:
 		epcmd->status = NVME_SC_INTERNAL;
@@ -1705,6 +2104,9 @@ static void pci_epf_nvme_init_ctrl_regs(struct pci_epf_nvme *epf_nvme)
 	/* Clear Persistent Memory Region Supported (PMRS) */
 	ctrl->cap &= ~(0x1ULL << 56);
 
+	/* Clear Controller Memory Buffer Supported (CMBS) */
+	//ctrl->cap &= ~(0x1ULL << 57);
+
 	/* Controller Memory Buffer Supported (CMBS) */
 	ctrl->cap |= (0x1ULL << 57);
 	ctrl->cmbloc = CMB_BIR;
@@ -2320,15 +2722,890 @@ static void pci_epf_nvme_admin_identify_hook(struct pci_epf_nvme *epf_nvme,
 	id->sgls = 0;
 }
 
+static u16 pci_epf_nvme_h2c(struct pci_epf_nvme *epf_nvme,
+			    size_t len,
+			    struct pci_epf_nvme_cmd *epcmd)
+{
+	int ret;
+
+	/* Set length and direction */
+	epcmd->transfer_len = len;
+	epcmd->dir = DMA_FROM_DEVICE;
+	/* Do directly nested inside sq_poll() */
+	epcmd->xfer_thread = &epf_nvme->sq_xfer_info;
+
+	/* Get an internal buffer for the command */
+	ret = pci_epf_nvme_alloc_cmd_buffer(epcmd);
+	if (ret) {
+		epcmd->status = NVME_SC_INTERNAL | NVME_SC_DNR;
+		pci_epf_nvme_send_cmd_to_completion(epcmd);
+		return -1;
+	}
+
+	ret = pci_epf_nvme_cmd_parse_dptr(epcmd);
+	if (ret < 0)
+		return NVME_SC_DATA_XFER_ERROR;
+
+	ret = pci_epf_nvme_cmd_transfer(epcmd);
+	if (ret < 0)
+		return NVME_SC_DATA_XFER_ERROR;
+
+	return NVME_SC_SUCCESS;
+}
+
+static u16 tsp_nvme_cs_identify(struct pci_epf_nvme_cmd *epcmd)
+{
+	int ret;
+	struct nvme_command *cmd;
+	u8 *buffer;
+
+	/* Get an internal buffer for the command */
+	ret = pci_epf_nvme_alloc_cmd_buffer(epcmd);
+	if (ret) {
+		epcmd->status = NVME_SC_INTERNAL | NVME_SC_DNR;
+		pci_epf_nvme_send_cmd_to_completion(epcmd);
+		return -1;
+	}
+
+	buffer = epcmd->buffer;
+	cmd = &epcmd->cmd;
+
+	switch (cmd->common.cdw11) {
+	case TSP_CS_CSX:
+		strncpy((char*)buffer, TSP_CS_ID_STRING, epcmd->transfer_len);
+		break;
+
+	default:
+		memset(buffer, 0, epcmd->transfer_len);
+		break;
+	}
+
+	pci_epf_nvme_set_xc_path(epcmd);
+	pci_epf_nvme_send_cmd_to_next(epcmd);
+
+	return -1;
+}
+
+static u16 tsp_nvme_cs_get(struct pci_epf_nvme_cmd *epcmd)
+{
+	int ret;
+	struct nvme_command *cmd;
+	u64 fun;
+	s32 function_id;
+	u8 *buffer;
+	CsFunctionBitSelect f;
+
+	/* Get an internal buffer for the command */
+	ret = pci_epf_nvme_alloc_cmd_buffer(epcmd);
+	if (ret) {
+		epcmd->status = NVME_SC_INTERNAL | NVME_SC_DNR;
+		pci_epf_nvme_send_cmd_to_completion(epcmd);
+		return -1;
+	}
+
+	buffer = epcmd->buffer;
+	cmd = &epcmd->cmd;
+
+	switch (cmd->common.cdw11) {
+	case TSP_CS_PROPS:
+		memcpy(&(tsp_csx_props.CSE), &tsp_cse_props, sizeof(tsp_cse_props));
+		memcpy(buffer, &tsp_csx_props, sizeof(tsp_csx_props));
+		break;
+
+	case TSP_CS_CAPS:
+		memcpy(buffer, &tsp_cs_caps, sizeof(CsCapabilities));
+		break;
+
+	case TSP_CS_FUN:
+		fun = (((u64)cmd->common.cdw12) | (((u64)cmd->common.cdw13) << 32));
+		memcpy(&f, &fun, sizeof(f));
+		if (f.Functions.Checksum) {
+			function_id = TSP_CHECKSUM_FUNCTION_ID; // Arbitrary FunctionId ... /// @todo change this
+		} else {
+			// No other functions supported yet
+			function_id = -1;
+		}
+		memcpy(buffer, &function_id, sizeof(function_id));
+	break;
+
+	default:
+		// Should not happen... return 0's
+		memset(buffer, 0, epcmd->transfer_len);
+		break;
+	}
+
+	pci_epf_nvme_set_xc_path(epcmd);
+	pci_epf_nvme_send_cmd_to_next(epcmd);
+
+	return -1;
+}
+
+static phys_addr_t tsp_allocate_in_cmb(struct pci_epf_nvme *epf_nvme,
+				       s32 bytes_requested)
+{
+	u64 cmbmsc;
+	phys_addr_t cba;
+	u8 *ptr, *base_ptr;
+
+	cmbmsc = pci_epf_nvme_reg_read64(&epf_nvme->ctrl, NVME_REG_CMBMSC);
+	cba = cmbmsc & CMBMSC_CBA_MASK;
+
+	if (cba) {
+		if (bytes_requested > 0) {
+			if (bytes_requested & (4096-1)) {
+				/// @todo change this ? maybe to lba size ?
+				return (phys_addr_t)NULL; // Do not allow requests that are not a multiple of 4096 bytes
+				// This will make sure we are 4k aligned in the CMB and that transfers don't transfer outside of buffer
+			}
+			// Allocate inside locally allocated cmb buffer
+			ptr = tsp_mm_alloc((size_t)bytes_requested,
+					   epf_nvme->tsp_alloc_ctx);
+			if (ptr) {
+				base_ptr = epf_nvme->reg[CMB_BIR];
+				// Conversion from pointer in local buffer to physical address (for host)
+				dev_dbg(&epf_nvme->epf->dev, "bytes req: %u base_ptr: %#0llx ptr: %#0llx\n", bytes_requested, (phys_addr_t)base_ptr, (phys_addr_t)ptr);
+				return cba + (ptr - base_ptr);
+			}
+		}
+	}
+	// All error / failed allocation cases return "NULL"
+	return (phys_addr_t)NULL;
+}
+
+static void tsp_deallocate_in_cmb(struct pci_epf_nvme *epf_nvme, phys_addr_t addr)
+{
+	u64 cmbmsc;
+	phys_addr_t cba;
+	void *ptr;
+
+	cmbmsc = pci_epf_nvme_reg_read64(&epf_nvme->ctrl, NVME_REG_CMBMSC);
+	cba = cmbmsc & CMBMSC_CBA_MASK;
+
+	if (cba) {
+		if (addr > cba) {
+			ptr = ((char*)(epf_nvme->reg[CMB_BIR])) + (addr - cba);
+			tsp_mm_free(ptr, epf_nvme->tsp_alloc_ctx);
+		}
+	}
+}
+
+static u16 tsp_nvme_cs_mm(struct pci_epf_nvme_cmd *epcmd)
+{
+	int ret;
+	struct pci_epf_nvme *epf_nvme = epcmd->epf_nvme;
+	struct nvme_command *cmd;
+	u8 *buffer;
+	u64 cmbmsc;
+	s32 bytes_requested;
+	phys_addr_t phys_addr, to_be_freed;
+
+	/* Get an internal buffer for the command */
+	ret = pci_epf_nvme_alloc_cmd_buffer(epcmd);
+	if (ret) {
+		epcmd->status = NVME_SC_INTERNAL | NVME_SC_DNR;
+		pci_epf_nvme_send_cmd_to_completion(epcmd);
+		return -1;
+	}
+
+	buffer = epcmd->buffer;
+	cmd = &epcmd->cmd;
+	cmbmsc = pci_epf_nvme_reg_read64(&epf_nvme->ctrl, NVME_REG_CMBMSC);
+
+	switch (cmd->common.cdw11) {
+	case TSP_CS_MEM:
+		phys_addr = (phys_addr_t)NULL;
+		if (!(cmbmsc & CMBMSC_CMSE_BIT) || !(cmbmsc & CMBMSC_CRE_BIT)) {
+			// No CMB enabled, cannot manage memory...
+			// (return a null addr)
+		} else {
+			if (cmd->common.cdw10 == TSP_CS_ALLOCATE) {
+				/// @note int32_t because CS API specifies "int" ...
+				bytes_requested = cmd->common.cdw12;
+				phys_addr = tsp_allocate_in_cmb(epf_nvme, bytes_requested);
+			} else if (cmd->common.cdw10 == TSP_CS_DEALLOCATE) {
+				to_be_freed = cmd->common.cdw12;
+				if (sizeof(phys_addr_t) == 8) {
+					// 64 bit hwaddr
+					to_be_freed |= ((phys_addr_t)cmd->common.cdw13) << 32;
+				}
+				tsp_deallocate_in_cmb(epf_nvme, to_be_freed);
+			}
+		}
+		memcpy(buffer, &phys_addr, sizeof(phys_addr));
+		break;
+
+	default:
+		break;
+	}
+
+	pci_epf_nvme_send_cmd_to_next(epcmd);
+
+	return -1;
+}
+
+static u16 tsp_compute_checksum(struct pci_epf_nvme *nvme,
+				phys_addr_t source, u32 len,
+				phys_addr_t dest)
+{
+	void *cmb_source, *cmb_dest;
+	u32 *source_as_u32, *dest_as_u32, checksum, i;
+
+	pci_epf_nvme_print_cmb_info(nvme);
+
+	if (pci_epf_nvme_addr_in_cmb(nvme, source) &&
+	    pci_epf_nvme_addr_in_cmb(nvme, dest) &&
+	    pci_epf_nvme_addr_in_cmb(nvme, source+len-1) &&
+	    pci_epf_nvme_addr_in_cmb(nvme, dest+sizeof(checksum)-1)) {
+		cmb_source = pci_epf_nvme_cmb_addr_as_local_addr(nvme, source);
+		cmb_dest = pci_epf_nvme_cmb_addr_as_local_addr(nvme, dest);
+		source_as_u32 = (u32*)cmb_source;
+		dest_as_u32 = (u32*)cmb_dest;
+		checksum = 0;
+		dev_info(&nvme->epf->dev, "Computing checksum :\n");
+		for (i = 0; i < len/sizeof(u32); ++i) {
+			checksum += source_as_u32[i];
+			//dev_info(&nvme->epf->dev, "value : %#08lx\n", source_as_u32[i]);
+		}
+		dev_info(&nvme->epf->dev, "Result : %#08x\n", checksum);
+		*dest_as_u32 = checksum;
+	} else {
+		dev_err(&nvme->epf->dev, "Data is outside of CMB\n"
+		"source: %#0llx, dest: %#0llx, len: %u\n", source, dest, len);
+		// Data is outside of CMB ... don't even try
+		return NVME_SC_DATA_XFER_ERROR;
+	}
+	return NVME_SC_SUCCESS;
+}
+
+static u16 tsp_do_compute_request(struct pci_epf_nvme *nvme,
+				  CsComputeRequest *creq)
+{
+	phys_addr_t source, dest;
+	u32 len;
+
+	switch (creq->FunctionId) {
+	case TSP_CHECKSUM_FUNCTION_ID:
+		/// @todo check arguments
+		source = (phys_addr_t)creq->Args[0].u.DevMem.MemHandle;
+		dest = (phys_addr_t)creq->Args[2].u.DevMem.MemHandle;
+		len = creq->Args[1].u.Value32;
+		return tsp_compute_checksum(nvme, source, len, dest);
+	case TSP_SLEEP_FUNCTION_ID:
+		len = creq->Args[0].u.Value32;
+		/* Sleeping in deferred requests (handled by a thread) makes
+		 * sense, sleeping in a synchronous command will block the
+		 * entire controller. This sleep is for testing purposes,
+		 * to estimate the time to handle compute requests */
+		//dev_info(&nvme->epf->dev, "Sleeping for %d msecs\n", len);
+		msleep_interruptible(len);
+		//dev_info(&nvme->epf->dev, "Done sleeping\n");
+		return NVME_SC_SUCCESS;
+	default:
+		/// @todo change error handling ?
+		return NVME_SC_INVALID_OPCODE;
+	}
+}
+
+/* This is a function to be threaded */
+static int tsp_do_async_compute_request_fn(void *opaque)
+{
+	AsyncComputeRequest *acreq = (AsyncComputeRequest*)opaque;
+	struct pci_epf_nvme_cmd *epcmd;
+
+	if (!acreq) {
+		pr_warn("Async compute request pointer is NULL\n");
+		return -EINVAL;
+	}
+
+	if (!acreq->creq) {
+		pr_warn("Async compute request compute request is NULL\n");
+		return -EINVAL;
+	}
+
+	epcmd = acreq->epcmd;
+
+	/* Set the status inside the request */
+	epcmd->status = tsp_do_compute_request(acreq->nvme, acreq->creq);
+	/* The thread frees the memory when it is no longer needed
+	 * (allocated by caller) */
+	kfree(acreq->creq);
+	kfree(acreq);
+
+	pci_epf_nvme_send_cmd_to_completion(epcmd);
+
+	return 0;
+}
+
+static u16 tsp_do_compute_request_sync(struct pci_epf_nvme *nvme,
+				       struct pci_epf_nvme_cmd *epcmd)
+{
+	return tsp_do_compute_request(nvme, (CsComputeRequest *)epcmd->buffer);
+}
+
+static u16 tsp_launch_async_compute(struct pci_epf_nvme *nvme,
+				    struct pci_epf_nvme_cmd *epcmd)
+{
+	struct nvme_command *cmd = &epcmd->cmd;
+	CsComputeRequest *creq;
+	AsyncComputeRequest *acreq;
+
+	/* Allocate memory for the thread, because the buffer is local */
+	creq = kzalloc(cmd->common.cdw12 /* req_size */, GFP_KERNEL);
+	if (creq == NULL) {
+		return NVME_SC_INTERNAL;
+	}
+	/** @note this copy could be omitted since the buffer lives as long as
+	 *  the command (so until the completion is sent) */
+	memcpy(creq, epcmd->buffer, cmd->common.cdw12 /* req_size */);
+	/* Allocate memory to pass to threaded function */
+	acreq = kzalloc(sizeof(AsyncComputeRequest), GFP_KERNEL);
+	if (acreq == NULL) {
+		kfree(creq);
+		return NVME_SC_INTERNAL;
+	}
+	/* Request lives as long as the queue does and the thread lives as
+	 * long as the queue lives, this is a shared structure between the
+	 * thread and the nvme controller code, the thread only sets the status
+	 * and the nvme code periodically checks (polls) the completion to see
+	 * if the thread finished, then joins the thread */
+	acreq->nvme = nvme; /* Very important ! */
+	acreq->epcmd = epcmd;
+	// WHY? req->status = NVME_SUCCESS; // Make sure it is not NVME_NO_COMPLETE
+	acreq->creq = creq;
+	//dev_info(&nvme->epf->dev, "Launching thread\n");
+	epcmd->thread = kthread_run(tsp_do_async_compute_request_fn, (void *)acreq, "TSP Async thread");
+
+	if (IS_ERR_OR_NULL(epcmd->thread)) {
+		// The thread could not be created
+		dev_err(&nvme->epf->dev, "TSP Error creating async compute thread");
+		kfree(acreq->creq);
+		kfree(acreq);
+		return NVME_SC_INTERNAL;
+	}
+
+	/* The dynamically allocated memory above is freed by the thread (maybe
+	 * not the best idea), the thread could return the acreq pointer and
+	 * both creq and acreq could be freed upon join... */
+
+	/* Dirty way to tell the caller not to enqueue the completion */
+	return (u16)-1;
+}
+
+static u16 tsp_nvme_cs_compute(struct pci_epf_nvme *nvme,
+			       struct pci_epf_nvme_cmd *epcmd)
+{
+	struct nvme_command *cmd = &epcmd->cmd;
+	u16 ret;
+
+	ret = pci_epf_nvme_h2c(nvme, SZ_4K, epcmd);
+	if (ret != NVME_SC_SUCCESS)
+		return ret;
+
+	if (cmd->common.cdw11) {
+		/* Synchronous */
+		return tsp_do_compute_request_sync(nvme, epcmd);
+	} else {
+		/* Asynchronous - will return -1 (deferred) or error code */
+		return tsp_launch_async_compute(nvme, epcmd);
+	}
+
+	return NVME_SC_SUCCESS;
+}
+
+u32 tsp_inet_addr(const char *str) {
+	int ret;
+	u32 addr;
+	u8 *addr_arr = (u8 *)&addr;
+
+	ret = sscanf(str, "%hhd.%hhd.%hhd.%hhd",
+		     &addr_arr[0], &addr_arr[1], &addr_arr[2], &addr_arr[3]);
+
+	if (ret < 4)
+		return -1;
+
+	return addr;
+}
+
+static int tsp_relay_thread_fn(void *opaque)
+{
+	struct tsp_relay_thread_args *rta =
+		(struct tsp_relay_thread_args *)opaque;
+	struct pci_epf_nvme *nvme = rta->nvme;
+	struct pci_epf_nvme_cmd *epcmd;
+	struct tsp_relay *relay = nvme->tsp_relays[rta->relay_desc];
+	struct kvec vec;
+	struct msghdr msg;
+	int ret = 0;
+
+	vec.iov_len = TSP_RELAY_BUFFER_SIZE;
+
+	msg.msg_name = 0;
+	msg.msg_namelen = 0;
+	msg.msg_control = NULL;
+	msg.msg_flags = 0;
+
+	dev_dbg(&nvme->epf->dev, "Relay %d : Thread launched\n",
+		rta->relay_desc);
+
+	while (1) {
+		/* Wait until we have a command to process */
+		wait_event_interruptible(relay->wq,
+					 !kfifo_is_empty(&relay->fifo) ||
+					 relay->shutdown);
+
+		/* Stop the thread */
+		if (relay->shutdown) {
+			break;
+		}
+
+		ret = kfifo_get(&relay->fifo, &epcmd);
+		if (ret != 1) {
+			dev_err(&nvme->epf->dev,
+			        "Could not get element from relay FIFO\n");
+		}
+
+		/* The relay buffers have the size before the data */
+		vec.iov_base = epcmd->buffer + sizeof(u32);
+
+		/* Fill the cmd buffer */
+		dev_dbg(&nvme->epf->dev, "v Relay %d : Blocking read on socket\n",
+			rta->relay_desc);
+		ret = kernel_recvmsg(relay->socket, &msg, &vec,
+				     TSP_RELAY_BUFFER_SIZE,
+				     TSP_RELAY_BUFFER_SIZE, msg.msg_flags);
+		dev_dbg(&nvme->epf->dev, "^ Relay %d : read %d bytes\n",
+			rta->relay_desc, ret);
+
+		if (ret < 0) {
+			dev_warn(&nvme->epf->dev, "Relay %d failed to read\n",
+				 rta->relay_desc);
+			break;
+		}
+
+		*((s32*)epcmd->buffer) = ret;
+
+		pci_epf_nvme_send_cmd_to_next(epcmd);
+	}
+
+	/* Empty the FIFO if needed note that this should not hold more than
+	   one command at a time ... */
+	while(!kfifo_is_empty(&relay->fifo)) {
+		ret = kfifo_get(&relay->fifo, &epcmd);
+		epcmd->status = NVME_SC_DATA_XFER_ERROR;
+		pci_epf_nvme_send_cmd_to_completion(epcmd);
+	}
+
+	kfree(rta);
+	return 0;
+}
+
+static int tsp_find_unallocated_relay(struct pci_epf_nvme *nvme)
+{
+	int i;
+	for (i = 0; i < TSP_RELAY_MAX_RELAYS; ++i) {
+		if (nvme->tsp_relays[i] == NULL) {
+			return i;
+		}
+	}
+	return -1;
+}
+
+static int tsp_new_relay(struct pci_epf_nvme *nvme,
+			 struct addr_info *ai)
+{
+	struct socket *sock = NULL;
+	struct sockaddr_in saddr = {0,};
+	struct tsp_relay *relay;
+	struct tsp_relay_thread_args *rta;
+	u32 addr;
+	u16 port;
+	int ret, relay_number = tsp_find_unallocated_relay(nvme);
+
+	if (relay_number < 0)
+		return relay_number;
+
+	dev_dbg(&nvme->epf->dev, "Relay %d : addr (node) : %s\n",
+		relay_number, ai->node);
+	dev_dbg(&nvme->epf->dev, "Relay %d : port (service) : %s\n",
+		relay_number, ai->service);
+
+	addr = tsp_inet_addr(ai->node);
+	if (addr == (u32)-1) {
+		dev_warn(&nvme->epf->dev,
+			 "Relay %d : Could not parse addr (node) : %s\n",
+			 relay_number, ai->node);
+		return -1;
+	}
+
+	ret = kstrtou16(ai->service, 10, &port);
+	if (ret < 0) {
+		dev_warn(&nvme->epf->dev,
+			 "Relay %d : Could not parse port (serice) : %s\n",
+			 relay_number, ai->node);
+		return -1;
+	}
+
+	saddr.sin_family = AF_INET;
+	saddr.sin_port = htons(port);
+	saddr.sin_addr.s_addr = addr;
+
+	ret = sock_create(PF_INET, SOCK_STREAM, IPPROTO_TCP, &sock);
+	if (ret < 0) {
+		dev_warn(&nvme->epf->dev, "Relay %d : Socket creation failed\n",
+			 relay_number);
+		return -1;
+	}
+
+	ret = sock->ops->connect(sock, (struct sockaddr *)&saddr, sizeof(saddr),
+				 O_RDWR);
+	if (ret) {
+		dev_warn(&nvme->epf->dev,
+			 "Relay %d : Could not connect, ret = %d\n",
+			 relay_number, ret);
+		sock_release(sock);
+		return -1;
+	}
+
+	relay = kzalloc(sizeof(struct tsp_relay), GFP_KERNEL);
+	if (!relay) {
+		dev_warn(&nvme->epf->dev, "Could not allocate relay\n");
+		sock_release(sock);
+		return -1;
+	}
+	ret = kfifo_alloc(&relay->fifo, PCI_EPF_NVME_FIFO_SIZE,
+			  GFP_KERNEL);
+	if (ret < 0) {
+		dev_err(&nvme->epf->dev, "Could not allocate relay FIFO\n");
+		kfree(relay);
+		sock_release(sock);
+		return ret;
+	}
+
+	nvme->tsp_relays[relay_number] = relay;
+	dev_dbg(&nvme->epf->dev, "Relay %d : Connected !\n", relay_number);
+	relay->socket = sock;
+	relay->shutdown = false;
+	init_waitqueue_head(&relay->wq);
+
+	/* These are freed by the thread itself */
+	rta = kzalloc(sizeof(struct tsp_relay_thread_args), GFP_KERNEL);
+	rta->nvme = nvme;
+	rta->relay_desc = relay_number;
+	relay->thread = kthread_run(tsp_relay_thread_fn, (void *)rta,
+				    "TSP relay thread %d", relay_number);
+
+	if (IS_ERR_OR_NULL(relay->thread)) {
+		/* The thread could not be created */
+		dev_err(&nvme->epf->dev, "TSP Error creating relay thread");
+		kfree(rta);
+		sock_release(sock);
+		return -1;
+	}
+
+	return relay_number;
+}
+
+static u16 tsp_nvme_address_info_from_req(struct pci_epf_nvme *nvme,
+					  struct pci_epf_nvme_cmd *epcmd,
+					  struct addr_info *ai) {
+	u16 ret;
+
+	ret = pci_epf_nvme_h2c(nvme, SZ_4K, epcmd);
+
+	if (ret != NVME_SC_SUCCESS)
+		return ret;
+
+	memcpy(ai, epcmd->buffer, sizeof(*ai));
+	return NVME_SC_SUCCESS;
+}
+
+static u16 tsp_nvme_cs_open_relay(struct pci_epf_nvme *nvme,
+				  struct pci_epf_nvme_cmd *epcmd)
+{
+	struct addr_info ai;
+	int desc;
+	u16 ret;
+
+	ret = tsp_nvme_address_info_from_req(nvme, epcmd, &ai);
+	if (ret != NVME_SC_SUCCESS)
+		return ret;
+
+	desc = tsp_new_relay(nvme, &ai);
+	if (desc < 0)
+		return NVME_SC_INTERNAL;
+
+	/* buffer is allocated in tsp_nvme_address_info_from_req */
+	*(s32*)epcmd->buffer = (s32)desc;
+
+	/* This is a bidirectional command */
+	epcmd->dir = DMA_TO_DEVICE;
+	pci_epf_nvme_set_xc_path(epcmd);
+	pci_epf_nvme_send_cmd_to_next(epcmd);
+
+	return -1;
+}
+
+static int tsp_nvme_cs_stop_relay_thread(struct pci_epf_nvme *nvme,
+					 struct tsp_relay *relay)
+{
+	int ret;
+	relay->shutdown = true;
+
+	/* The thread could be waiting on a buffer */
+	wake_up(&relay->wq);
+
+	/* The thread could be blocked on recv() on socket */
+	kernel_sock_shutdown(relay->socket, SHUT_RDWR);
+	ret = kthread_stop(relay->thread);
+	sock_release(relay->socket);
+
+	return ret;
+}
+
+static u16 tsp_nvme_cs_close_relay(struct pci_epf_nvme *nvme,
+				   struct pci_epf_nvme_cmd *epcmd)
+{
+	int ret;
+	int desc = epcmd->cmd.common.cdw13;
+	struct tsp_relay *relay;
+
+	if (desc < 0 || desc >= TSP_RELAY_MAX_RELAYS) {
+		/* Out of range... */
+		return NVME_SC_INVALID_FIELD;
+	}
+
+	relay = nvme->tsp_relays[desc];
+
+	if (!relay) {
+		dev_warn(&nvme->epf->dev, "Relay %d is already closed\n", desc);
+	} else {
+		ret = tsp_nvme_cs_stop_relay_thread(nvme, relay);
+
+		kfree(relay);
+		nvme->tsp_relays[desc] = NULL;
+	}
+
+	return NVME_SC_SUCCESS;
+}
+
+static inline void tsp_nvme_cmd_to_read_relay(struct pci_epf_nvme_cmd *epcmd)
+{
+	struct tsp_relay *relay = epcmd->epf_nvme->tsp_relays[epcmd->relay_desc];
+
+	/* XXX TODO Handle full FIFO (unlikely) XXX */
+	kfifo_in(&relay->fifo, &epcmd, 1);
+	wake_up(&relay->wq);
+}
+
+#if 0 /* XXX TODO handle close relay in edge cases */
+
+/* Do not use this function in a thread, call only if filled_buffers is not
+ * empty, this is a very specific helper function, don't use */
+static u16 tsp_nvme_cs_comm_to_host(struct pci_epf_nvme *nvme,
+				    struct pci_epf_nvme_cmd *epcmd)
+{
+	/// @todo check data_len
+	int ret = NVME_SC_SUCCESS;
+	int desc = epcmd->cmd.common.cdw13;
+	struct tsp_relay *relay = nvme->tsp_relays[desc];
+
+	if (!relay) {
+		dev_warn(&nvme->epf->dev, "Relay %d isn't allocated\n", desc);
+		epcmd->status = NVME_SC_DATA_XFER_ERROR;
+		return NVME_SC_DATA_XFER_ERROR;
+	}
+
+	/** @todo it could be better to use the CQE "result" field to pass the
+	 * size */
+	dev_dbg(&nvme->epf->dev,
+		"Relay %d : Transferring 4k buffer with %d bytes to host\n",
+		desc, relay->buffer.pack.size);
+
+	ret = pci_epf_nvme_cmd_parse_dptr(nvme, epcmd, SZ_4K);
+	if (ret < 0) {
+		return epcmd->status;
+	}
+	/** @todo this copy could be avoided but requires to have the relay
+	 * thread fill the data directly into the requests */
+	memcpy(epcmd->buffer, &relay->buffer.pack, SZ_4K);
+	ret = pci_epf_nvme_cmd_transfer(nvme, epcmd, DMA_TO_DEVICE /* c2h */);
+	if (ret < 0) {
+		return epcmd->status;
+	}
+
+	relay->buffer_full = false;
+	wake_up(&relay->wq);
+
+	if (relay->buffer.pack.size == 0) {
+		/* Disconnection, close relay (stops thread) */
+		dev_dbg(&nvme->epf->dev,
+			"Relay %d : socket disconnected, closing relay\n", desc);
+
+		return tsp_nvme_cs_close_relay(nvme, epcmd);
+	}
+
+	return epcmd->status;
+}
+
+#endif
+
+static u16 tsp_nvme_cs_comm(struct pci_epf_nvme *nvme,
+			    struct pci_epf_nvme_cmd *epcmd)
+{
+	struct msghdr msg;
+	struct kvec vec;
+	struct socket *sock;
+	u32 write_nread = epcmd->cmd.common.cdw11;
+	u32 length = epcmd->cmd.common.cdw12;
+	u32 desc = epcmd->cmd.common.cdw13;
+	u16 ret;
+
+	if (desc >= TSP_RELAY_MAX_RELAYS) {
+		dev_warn(&nvme->epf->dev,
+			 "Relay with descriptor %d does not exist\n", desc);
+		return NVME_SC_INVALID_FIELD;
+	}
+	if (!nvme->tsp_relays[desc]) {
+		dev_warn(&nvme->epf->dev,
+			 "Relay with descriptor %d is not allocated\n", desc);
+		return NVME_SC_INVALID_FIELD;
+	}
+
+	sock = nvme->tsp_relays[desc]->socket;
+
+	if (!sock) {
+		dev_warn(&nvme->epf->dev,
+			 "Relay with descriptor %d has no socket\n", desc);
+		return NVME_SC_DATA_XFER_ERROR;
+	}
+
+	if (length > SZ_4K) {
+		dev_warn(&nvme->epf->dev,
+			 "Cannot send more than 4k for the moment\n");
+		return NVME_SC_DATA_XFER_ERROR;
+	}
+
+	if (write_nread) {
+		/* If this is a write get data from host */
+		ret = pci_epf_nvme_h2c(nvme, SZ_4K, epcmd);
+		if (ret != NVME_SC_SUCCESS) {
+			return ret;
+		}
+
+		dev_dbg(&nvme->epf->dev,
+			"Relay %d : Writing %d bytes to socket\n", desc, length);
+
+		msg.msg_name = 0;
+		msg.msg_namelen = 0;
+		msg.msg_control = NULL;
+		msg.msg_controllen = 0;
+		msg.msg_flags = 0;
+
+		vec.iov_len = length;
+		vec.iov_base = epcmd->buffer;
+		/* And send it into the socket */
+		ret = kernel_sendmsg(sock, &msg, &vec, length, length);
+		if (ret < 0) {
+			dev_warn(&nvme->epf->dev,
+				 "Relay %d : Failed to write to socket\n", desc);
+			return NVME_SC_INTERNAL;
+		} else if (ret < length) {
+			dev_warn(&nvme->epf->dev,
+				 "Relay %d : Failed to write all data to socket\n",
+				 desc);
+			return NVME_SC_DATA_XFER_ERROR;
+		}
+		return NVME_SC_SUCCESS;
+	} else {
+		/* This is a read */
+		dev_dbg(&nvme->epf->dev,
+			"Relay %d : A socket read was requested...\n", desc);
+
+		epcmd->transfer_len = SZ_4K;
+		epcmd->dir = DMA_TO_DEVICE;
+		pci_epf_nvme_set_xc_path(epcmd);
+		/* Get an internal buffer for the command */
+		ret = pci_epf_nvme_alloc_cmd_buffer(epcmd);
+		if (ret) {
+			epcmd->status = NVME_SC_INTERNAL | NVME_SC_DNR;
+			pci_epf_nvme_send_cmd_to_completion(epcmd);
+			return -1;
+		}
+
+		epcmd->relay_desc = desc;
+		pci_epf_nvme_set_rxc_path(epcmd);
+		pci_epf_nvme_send_cmd_to_next(epcmd);
+		return (u16)-1; /* deferred */
+	}
+
+	return NVME_SC_SUCCESS;
+}
+
+static u16 pci_epf_nvme_process_custom_admin_cmd(struct pci_epf_nvme *nvme,
+						 struct pci_epf_nvme_cmd *epcmd)
+{
+	struct nvme_command *cmd;
+	cmd = &epcmd->cmd;
+	dev_dbg(&nvme->epf->dev, "TSP: Opcode: %#x, CDW10: %#x, CDW11: %#x\n",
+		cmd->common.opcode, cmd->common.cdw10, cmd->common.cdw11);
+	switch (cmd->common.cdw10) {
+	case TSP_CS_IDENTIFY:
+		epcmd->transfer_len = SZ_4K;
+		epcmd->dir = DMA_TO_DEVICE;
+		pci_epf_nvme_set_xc_path(epcmd);
+		return tsp_nvme_cs_identify(epcmd);
+	case TSP_CS_GET:
+		epcmd->transfer_len = SZ_4K;
+		epcmd->dir = DMA_TO_DEVICE;
+		pci_epf_nvme_set_xc_path(epcmd);
+		return tsp_nvme_cs_get(epcmd);
+	case TSP_CS_ALLOCATE:
+		/* fallthrough */
+	case TSP_CS_DEALLOCATE:
+		epcmd->transfer_len = SZ_4K;
+		epcmd->dir = DMA_TO_DEVICE;
+		pci_epf_nvme_set_xc_path(epcmd);
+		return tsp_nvme_cs_mm(epcmd);
+	case TSP_CS_COMPUTE:
+		return tsp_nvme_cs_compute(nvme, epcmd);
+	case TSP_CS_COMM:
+		return tsp_nvme_cs_comm(nvme, epcmd);
+	case TSP_CS_OPEN_RELAY:
+		return tsp_nvme_cs_open_relay(nvme, epcmd);
+	case TSP_CS_CLOSE_RELAY:
+		return tsp_nvme_cs_close_relay(nvme, epcmd);
+	default:
+		break;
+	}
+
+	return NVME_SC_INVALID_OPCODE | NVME_SC_DNR;
+}
+
 static void pci_epf_nvme_process_admin_cmd(struct pci_epf_nvme_cmd *epcmd)
 {
 	void (*post_process_hook)(struct pci_epf_nvme *,
 				  struct pci_epf_nvme_cmd *) = NULL;
 	struct pci_epf_nvme *epf_nvme = epcmd->epf_nvme;
 	struct nvme_command *cmd = &epcmd->cmd;
+	u16 status;
 	int ret = 0;
 
-	switch (cmd->common.opcode) {
+	if (epcmd->cmd.common.opcode >= nvme_admin_vendor_start) {
+		status = pci_epf_nvme_process_custom_admin_cmd(epf_nvme, epcmd);
+		/* The above returns -1 to show that the cmd is deferred */
+		if (status == (u16)-1) {
+			/* Request is handled by another thread / task */
+			return;
+		} else if (status < 0) {
+			dev_warn(&epf_nvme->epf->dev, "Negative status from custom admin command\n");
+		} else {
+			/* This might not be needed, it should be set */
+			epcmd->status = status;
+		}
+		goto complete;
+	}
+
+	switch (epcmd->cmd.common.opcode) {
 	case nvme_admin_identify:
 		post_process_hook = pci_epf_nvme_admin_identify_hook;
 		epcmd->transfer_len = NVME_IDENTIFY_DATA_SIZE;
@@ -2646,6 +3923,11 @@ static int pci_epf_nvme_set_bars(struct pci_epf *epf)
 				return ret;
 		}
 	}
+
+	/* Init CMB memory management context */
+	tsp_mm_init_context(epf_nvme->reg[CMB_BIR],
+			    epf_nvme->epf->bar[CMB_BIR].size,
+			    &epf_nvme->tsp_alloc_ctx);
 
 	return 0;
 }
@@ -2994,6 +4276,17 @@ static int pci_epf_nvme_probe(struct pci_epf *epf,
 		return -ENOMEM;
 
 	epf_nvme->epf = epf;
+
+	/* Prepare generic transfer thread info if we want to do transfers
+	   from within the sq_poll work function */
+	epf_nvme->sq_xfer_info.prp_list_buf = kzalloc(NVME_CTRL_PAGE_SIZE,
+						      GFP_KERNEL);
+	if (!epf_nvme->sq_xfer_info.prp_list_buf)
+		return -ENOMEM; /* XXX memory should be freed XXX */
+	epf_nvme->sq_xfer_info.dma.dma_supported = false;
+	epf_nvme->sq_xfer_info.tid = -1; /* No thread ID, this is special */
+	epf_nvme->sq_xfer_info.epf_nvme = epf_nvme;
+
 	INIT_DELAYED_WORK(&epf_nvme->reg_poll, pci_epf_nvme_reg_poll);
 	INIT_DELAYED_WORK(&epf_nvme->sq_poll, pci_epf_nvme_sq_poll);
 	dev_info(&epf_nvme->epf->dev, "Version with threads and bulk SQEs\n");
