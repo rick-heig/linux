@@ -30,6 +30,11 @@
 #define PCI_EPF_NVME_TEST_CMD_NOWAIT 0
 
 /*
+ * Time to (busy) wait in microseconds if the completion queue is full
+ */
+#define PCI_EPF_NVME_CQ_FULL_DELAY_US 10
+
+/*
  * Maximum data transfer size: limit to 128 KB to avoid excessive local
  * memory use for buffers.
  */
@@ -688,8 +693,14 @@ static void pci_epf_nvme_queue_response(struct pci_epf_nvme_cmd *epcmd)
 
 	spin_lock_irqsave(&ctrl->qlock, flags);
 
-	/* XXX Check completion queue full state XXX */
 	cq->head = pci_epf_nvme_reg_read32(ctrl, cq->db);
+
+	/* Check completion queue full state */
+	while (((cq->head + 1) == cq->tail) ||
+		(((cq->head + 1) == cq->depth) && (cq->tail == 0))) {
+		udelay(PCI_EPF_NVME_CQ_FULL_DELAY_US);
+		cq->head = pci_epf_nvme_reg_read32(ctrl, cq->db);
+	}
 
 	/* Setup the completion entry */
 	cqe->sq_id = cpu_to_le16(epcmd->sqid);
