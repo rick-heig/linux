@@ -116,7 +116,6 @@ struct pci_epf_nvme_ctrl {
 	size_t				mps;
 	size_t				mps_mask;
 
-	spinlock_t			qlock;
 	unsigned int			nr_queues;
 	struct pci_epf_nvme_queue	*sq;
 	struct pci_epf_nvme_queue	*cq;
@@ -750,7 +749,6 @@ static inline void __pci_epf_nvme_queue_response(struct pci_epf_nvme_cmd *epcmd)
 	struct pci_epf_nvme_queue *sq = &ctrl->sq[epcmd->sqid];
 	struct pci_epf_nvme_queue *cq = &ctrl->cq[epcmd->cqid];
 	struct nvme_completion *cqe = &epcmd->cqe;
-	unsigned long flags;
 
 	/*
 	 * Do not try to complete commands if the controller is not ready
@@ -758,9 +756,6 @@ static inline void __pci_epf_nvme_queue_response(struct pci_epf_nvme_cmd *epcmd)
 	 */
 	if (!pci_epf_nvme_ctrl_ready(ctrl))
 		goto free;
-
-	/* XXX Is this spinlock really necessary ? XXX */
-	spin_lock_irqsave(&ctrl->qlock, flags);
 
 	cq->head = pci_epf_nvme_reg_read32(ctrl, cq->db);
 
@@ -791,8 +786,6 @@ static inline void __pci_epf_nvme_queue_response(struct pci_epf_nvme_cmd *epcmd)
 		cq->tail = 0;
 		cq->phase ^= 1;
 	}
-
-	spin_unlock_irqrestore(&ctrl->qlock, flags);
 
 	pci_epf_nvme_raise_irq(epf_nvme, cq);
 
@@ -844,7 +837,6 @@ pci_epf_nvme_fetch_cmd(struct pci_epf_nvme *epf_nvme, int qid)
 	struct pci_epf_nvme_ctrl *ctrl = &epf_nvme->ctrl;
 	struct pci_epf_nvme_queue *sq = &ctrl->sq[qid];
 	struct pci_epf_nvme_cmd *epcmd;
-	unsigned long flags;
 
 	if (!sq->size)
 		return NULL;
@@ -871,11 +863,9 @@ pci_epf_nvme_fetch_cmd(struct pci_epf_nvme *epf_nvme, int qid)
 		qid, (int)sq->head, (int)sq->depth, (int)sq->tail,
 		pci_epf_nvme_cmd_name(epcmd));
 
-	spin_lock_irqsave(&ctrl->qlock, flags);
 	sq->head++;
 	if (sq->head == sq->depth)
 		sq->head = 0;
-	spin_unlock_irqrestore(&ctrl->qlock, flags);
 
 	return epcmd;
 }
@@ -1372,7 +1362,6 @@ static int pci_epf_nvme_create_ctrl(struct pci_epf *epf)
 	}
 
 	memset(ctrl, 0, sizeof(*ctrl));
-	spin_lock_init(&ctrl->qlock);
 
 	nctrl = nvmf_create_ctrl(dev, epf_nvme->ctrl_opts_buf);
 	if (IS_ERR(nctrl)) {
