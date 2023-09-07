@@ -1078,6 +1078,7 @@ static int pci_epf_nvme_map_cq(struct pci_epf_nvme *epf_nvme, int qid,
 	ret = pci_epf_mem_map(epf, pci_addr, qsize, &cq->map);
 	if (ret != qsize) {
 		if (ret > 0) {
+			pci_epf_mem_unmap(epf, &cq->map);
 			dev_err(&epf->dev, "Partial CQ %d mapping\n", qid);
 			ret = -ENOMEM;
 		} else {
@@ -1144,6 +1145,7 @@ static int pci_epf_nvme_map_sq(struct pci_epf_nvme *epf_nvme, int qid,
 	if (ret != qsize) {
 		if (ret > 0) {
 			dev_err(&epf->dev, "Partial SQ %d mapping\n", qid);
+			pci_epf_mem_unmap(epf, &sq->map);
 			ret = -ENOMEM;
 		} else {
 			dev_err(&epf->dev, "Map SQ %d failed\n", qid);
