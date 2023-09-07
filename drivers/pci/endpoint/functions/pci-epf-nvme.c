@@ -479,7 +479,8 @@ static int pci_epf_nvme_mmio_transfer(struct pci_epf_nvme *nvme,
 
 static int pci_epf_nvme_transfer(struct pci_epf_nvme *epf_nvme,
 				 struct pci_epf_nvme_segment *seg,
-				 enum dma_data_direction dir, void *buf)
+				 enum dma_data_direction dir, void *buf,
+				 bool no_dma)
 {
 	struct pci_epf_nvme_ctrl *ctrl = &epf_nvme->ctrl;
 	struct pci_epf *epf = epf_nvme->epf;
@@ -618,7 +619,7 @@ static int pci_epf_nvme_cmd_transfer(struct pci_epf_nvme *epf_nvme,
 			goto xfer_err;
 		}
 
-		ret = pci_epf_nvme_transfer(epf_nvme, seg, dir, buf);
+		ret = pci_epf_nvme_transfer(epf_nvme, seg, dir, buf, false);
 		if (ret)
 			goto xfer_err;
 
@@ -792,7 +793,7 @@ static int pci_epf_nvme_get_prp_list(struct pci_epf_nvme *epf_nvme, u64 prp,
 	seg.pci_addr = prp;
 	seg.size = min(pci_epf_nvme_prp_size(ctrl, prp), nr_prps << 3);
 	ret = pci_epf_nvme_transfer(epf_nvme, &seg, DMA_FROM_DEVICE,
-				    epf_nvme->prp_list_buf);
+				    epf_nvme->prp_list_buf, true /* no_dma */);
 	if (ret)
 		return ret;
 
