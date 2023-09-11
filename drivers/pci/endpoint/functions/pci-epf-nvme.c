@@ -94,6 +94,8 @@ struct pci_epf_nvme_queue {
 	size_t			qes;
 
 	struct pci_epc_map	map;
+
+	struct nvme_command	*local_queue;
 };
 
 struct pci_epf_nvme;
@@ -147,7 +149,7 @@ struct pci_epf_nvme_cmd {
 	int				sqid;
 	int				cqid;
 	unsigned int			status;
-	struct nvme_command 		cmd;
+	struct nvme_command 		*cmd;
 	struct nvme_completion		cqe;
 
 	enum dma_data_direction		dir;
@@ -616,7 +618,7 @@ static void pci_epf_nvme_free_cmd(struct pci_epf_nvme_cmd *epcmd)
 
 static const char *pci_epf_nvme_cmd_name(struct pci_epf_nvme_cmd *epcmd)
 {
-	u8 opcode = epcmd->cmd.common.opcode;
+	u8 opcode = epcmd->cmd->common.opcode;
 
 	if (epcmd->sqid)
 		return nvme_get_opcode_str(opcode);
@@ -792,7 +794,7 @@ static inline void __pci_epf_nvme_queue_response(struct pci_epf_nvme_cmd *epcmd)
 	/* Setup the completion entry */
 	cqe->sq_id = cpu_to_le16(epcmd->sqid);
 	cqe->sq_head = cpu_to_le16(sq->head);
-	cqe->command_id = epcmd->cmd.common.command_id;
+	cqe->command_id = epcmd->cmd->common.command_id;
 	cqe->status = cpu_to_le16((epcmd->status << 1) | cq->phase);
 
 	/* Post the completion entry */
@@ -816,7 +818,7 @@ static inline void __pci_epf_nvme_queue_response(struct pci_epf_nvme_cmd *epcmd)
 		dev_err(&epcmd->epf_nvme->epf->dev,
 			"QID %d: command %s (0x%x) failed, status 0x%0x\n",
 			epcmd->cqid, pci_epf_nvme_cmd_name(epcmd),
-			epcmd->cmd.common.opcode, epcmd->status);
+			epcmd->cmd->common.opcode, epcmd->status);
 
 free:
 	pci_epf_nvme_free_cmd(epcmd);
@@ -896,7 +898,9 @@ pci_epf_nvme_fetch_cmd(struct pci_epf_nvme *epf_nvme, int qid)
 
 	/* Get the NVMe command submitted by the host */
 	pci_epf_nvme_init_cmd(epf_nvme, epcmd, sq->qid, sq->cqid);
-	memcpy_fromio(&epcmd->cmd, sq->map.virt_addr + sq->head * sq->qes,
+	/* XXX This will be transfered in bulk in the future XXX */
+	epcmd->cmd = &sq->local_queue[sq->head];
+	memcpy_fromio(epcmd->cmd, sq->map.virt_addr + sq->head * sq->qes,
 		      sizeof(struct nvme_command));
 
 	dev_dbg(&epf_nvme->epf->dev,
@@ -944,7 +948,7 @@ static int pci_epf_nvme_cmd_parse_prp_list(struct pci_epf_nvme *epf_nvme,
 					   size_t transfer_len)
 {
 	struct pci_epf_nvme_ctrl *ctrl = &epf_nvme->ctrl;
-	struct nvme_command *cmd = &epcmd->cmd;
+	struct nvme_command *cmd = epcmd->cmd;
 	__le64 *prps = epf_nvme->prp_list_buf;
 	struct pci_epf_nvme_segment *seg;
 	size_t size = 0, ofst, prp_size, xfer_len;
@@ -1068,7 +1072,7 @@ static int pci_epf_nvme_cmd_parse_prp_simple(struct pci_epf_nvme *epf_nvme,
 					     size_t transfer_len)
 {
 	struct pci_epf_nvme_ctrl *ctrl = &epf_nvme->ctrl;
-	struct nvme_command *cmd = &epcmd->cmd;
+	struct nvme_command *cmd = epcmd->cmd;
 	int ret, nr_segs = 1;
 	u64 prp1, prp2 = 0;
 	size_t prp1_size;
@@ -1122,7 +1126,7 @@ static int pci_epf_nvme_cmd_parse_dptr(struct pci_epf_nvme *epf_nvme,
 				       size_t transfer_len)
 {
 	struct pci_epf_nvme_ctrl *ctrl = &epf_nvme->ctrl;
-	struct nvme_command *cmd = &epcmd->cmd;
+	struct nvme_command *cmd = epcmd->cmd;
 	u64 prp1 = le64_to_cpu(cmd->common.dptr.prp1);
 	size_t ofst;
 	int ret;
@@ -1131,7 +1135,7 @@ static int pci_epf_nvme_cmd_parse_dptr(struct pci_epf_nvme *epf_nvme,
 		goto invalid_field;
 
 	/* We do not support SGL for now */
-	if (epcmd->cmd.common.flags & NVME_CMD_SGL_ALL)
+	if (cmd->common.flags & NVME_CMD_SGL_ALL)
 		goto invalid_field;
 
 	/* Get pci segments for the command using its prps */
@@ -1252,6 +1256,11 @@ static void pci_epf_nvme_unmap_sq(struct pci_epf_nvme *epf_nvme, int qid)
 	epf_nvme->ctrl.cq[sq->cqid].ref--;
 
 	pci_epf_mem_unmap(epf_nvme->epf, &sq->map);
+	/* XXX TODO Check that queue is empty before freeing XXX
+	   Because in-flight commands could still refer the data inside this
+	   queue ! */
+	if (sq->local_queue)
+		kfree(sq->local_queue);
 	memset(sq, 0, sizeof(*sq));
 }
 
@@ -1292,6 +1301,15 @@ static int pci_epf_nvme_map_sq(struct pci_epf_nvme *epf_nvme, int qid,
 		}
 		memset(sq, 0, sizeof(*sq));
 		return ret;
+	}
+
+	sq->local_queue = kmalloc(sq->depth * sizeof(struct nvme_command),
+				  GFP_KERNEL);
+
+	if (!sq->local_queue) {
+		dev_err(&epf->dev, "Couldn't allocate space for local queue\n");
+		pci_epf_mem_unmap(epf, &sq->map);
+		ret = -ENOMEM;
 	}
 
 	/* Get a reference on the completion queue */
@@ -1628,7 +1646,7 @@ complete:
 static int pci_epf_nvme_submit_cmd_nowait(struct pci_epf_nvme *epf_nvme,
 					  struct pci_epf_nvme_cmd *epcmd)
 {
-	struct nvme_command *cmd = &epcmd->cmd;
+	struct nvme_command *cmd = epcmd->cmd;
 	struct request_queue *q;
 	struct request *req;
 	void *buffer = epcmd->buffer;
@@ -1679,7 +1697,7 @@ err:
 static void pci_epf_nvme_submit_sync_cmd(struct pci_epf_nvme *epf_nvme,
 					 struct pci_epf_nvme_cmd *epcmd)
 {
-	struct nvme_command *cmd = &epcmd->cmd;
+	struct nvme_command *cmd = epcmd->cmd;
 	struct request_queue *q;
 	int ret;
 
@@ -1723,7 +1741,7 @@ static inline void pci_epf_nvme_dispatch_cmd_xfer_first(
 static void pci_epf_nvme_admin_create_cq(struct pci_epf_nvme *epf_nvme,
 					 struct pci_epf_nvme_cmd *epcmd)
 {
-	struct nvme_command *cmd = &epcmd->cmd;
+	struct nvme_command *cmd = epcmd->cmd;
 	int mqes = NVME_CAP_MQES(epf_nvme->ctrl.cap);
 	u16 cqid, cq_flags, qsize, vector;
 	int ret;
@@ -1768,7 +1786,7 @@ static void pci_epf_nvme_admin_create_cq(struct pci_epf_nvme *epf_nvme,
 static void pci_epf_nvme_admin_create_sq(struct pci_epf_nvme *epf_nvme,
 					 struct pci_epf_nvme_cmd *epcmd)
 {
-	struct nvme_command *cmd = &epcmd->cmd;
+	struct nvme_command *cmd = epcmd->cmd;
 	int mqes = NVME_CAP_MQES(epf_nvme->ctrl.cap);
 	u16 sqid, cqid, sq_flags, qsize;
 	int ret;
@@ -1813,7 +1831,7 @@ static void pci_epf_nvme_admin_create_sq(struct pci_epf_nvme *epf_nvme,
 static void pci_epf_nvme_admin_identify_hook(struct pci_epf_nvme *epf_nvme,
 					     struct pci_epf_nvme_cmd *epcmd)
 {
-	struct nvme_command *cmd = &epcmd->cmd;
+	struct nvme_command *cmd = epcmd->cmd;
 	struct nvme_id_ctrl *id = epcmd->buffer;
 	unsigned int page_shift;
 
@@ -1843,6 +1861,7 @@ static bool pci_epf_nvme_process_admin_cmd(struct pci_epf_nvme *epf_nvme)
 	void (*post_process_hook)(struct pci_epf_nvme *,
 				  struct pci_epf_nvme_cmd *) = NULL;
 	struct pci_epf_nvme_cmd *epcmd;
+	struct nvme_command *cmd;
 	size_t transfer_len = 0;
 	int ret = 0;
 
@@ -1851,7 +1870,9 @@ static bool pci_epf_nvme_process_admin_cmd(struct pci_epf_nvme *epf_nvme)
 	if (!epcmd)
 		return false;
 
-	switch (epcmd->cmd.common.opcode) {
+	cmd = epcmd->cmd;
+
+	switch (cmd->common.opcode) {
 	case nvme_admin_identify:
 		post_process_hook = pci_epf_nvme_admin_identify_hook;
 		transfer_len = NVME_IDENTIFY_DATA_SIZE;
@@ -1860,7 +1881,7 @@ static bool pci_epf_nvme_process_admin_cmd(struct pci_epf_nvme *epf_nvme)
 		break;
 
 	case nvme_admin_get_log_page:
-		transfer_len = nvme_get_log_page_len(&epcmd->cmd);
+		transfer_len = nvme_get_log_page_len(cmd);
 		epcmd->pending_xfer_to_host = true;
 		epcmd->dir = DMA_TO_DEVICE;
 		break;
@@ -1892,7 +1913,7 @@ static bool pci_epf_nvme_process_admin_cmd(struct pci_epf_nvme *epf_nvme)
 	default:
 		dev_err(&epf_nvme->epf->dev,
 			"Unhandled admin command %s (0x%02x)\n",
-			pci_epf_nvme_cmd_name(epcmd), epcmd->cmd.common.opcode);
+			pci_epf_nvme_cmd_name(epcmd), cmd->common.opcode);
 		epcmd->status = NVME_SC_INVALID_OPCODE | NVME_SC_DNR;
 		goto complete;
 	}
@@ -1927,13 +1948,14 @@ complete:
 
 static inline size_t pci_epf_nvme_rw_data_len(struct pci_epf_nvme_cmd *epcmd)
 {
-	return ((u32)le16_to_cpu(epcmd->cmd.rw.length) + 1) <<
+	return ((u32)le16_to_cpu(epcmd->cmd->rw.length) + 1) <<
 		epcmd->ns->lba_shift;
 }
 
 static bool pci_epf_nvme_process_io_cmd(struct pci_epf_nvme *epf_nvme, int qid)
 {
 	struct pci_epf_nvme_cmd *epcmd;
+	struct nvme_command *cmd;
 	size_t transfer_len = 0;
 	int ret;
 
@@ -1942,15 +1964,17 @@ static bool pci_epf_nvme_process_io_cmd(struct pci_epf_nvme *epf_nvme, int qid)
 	if (!epcmd)
 		return false;
 
+	cmd = epcmd->cmd;
+
 	/* Get the command target namespace */
 	epcmd->ns = nvme_find_get_ns(epf_nvme->ctrl.ctrl,
-				     le32_to_cpu(epcmd->cmd.common.nsid));
+				     le32_to_cpu(cmd->common.nsid));
 	if (!epcmd->ns) {
 		epcmd->status = NVME_SC_INVALID_NS | NVME_SC_DNR;
 		goto complete;
 	}
 
-	switch (epcmd->cmd.common.opcode) {
+	switch (cmd->common.opcode) {
 	case nvme_cmd_read:
 		transfer_len = pci_epf_nvme_rw_data_len(epcmd);
 		epcmd->pending_xfer_to_host = true;
@@ -1963,7 +1987,7 @@ static bool pci_epf_nvme_process_io_cmd(struct pci_epf_nvme *epf_nvme, int qid)
 		break;
 
 	case nvme_cmd_dsm:
-		transfer_len = (le32_to_cpu(epcmd->cmd.dsm.nr) + 1) *
+		transfer_len = (le32_to_cpu(cmd->dsm.nr) + 1) *
 			sizeof(struct nvme_dsm_range);
 		epcmd->dir = DMA_FROM_DEVICE;
 		goto complete;
@@ -1976,7 +2000,7 @@ static bool pci_epf_nvme_process_io_cmd(struct pci_epf_nvme *epf_nvme, int qid)
 		dev_err(&epf_nvme->epf->dev,
 			"Unhandled IO command %s (0x%02x)\n",
 			pci_epf_nvme_cmd_name(epcmd),
-			epcmd->cmd.common.opcode);
+			cmd->common.opcode);
 		epcmd->status = NVME_SC_INVALID_OPCODE | NVME_SC_DNR;
 		goto complete;
 	}
