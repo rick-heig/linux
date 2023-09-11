@@ -21,6 +21,7 @@
 #include <linux/kfifo.h>
 #include <linux/spinlock.h>
 #include <linux/atomic.h>
+#include <linux/kthread.h>
 #include <generated/utsrelease.h>
 
 #include "../../../nvme/host/nvme.h"
@@ -31,6 +32,7 @@
  * To test the no wait version for submitting commands
  */
 #define PCI_EPF_NVME_TEST_CMD_NOWAIT 0
+#define PCI_EPF_NVME_THREADS 1
 
 /*
  * Time to (busy) wait in microseconds if the completion queue is full
@@ -57,6 +59,12 @@
 static struct workqueue_struct *epf_nvme_reg_wq;
 static struct workqueue_struct *epf_nvme_sq_wq;
 static struct kmem_cache *epf_nvme_cmd_cache;
+#if PCI_EPF_NVME_THREADS
+struct task_struct	*xfer_thread;
+DECLARE_WAIT_QUEUE_HEAD(xfer_wq);
+struct task_struct	*cq_thread;
+DECLARE_WAIT_QUEUE_HEAD(cq_wq);
+#endif
 
 /*
  * Host PCI memory segment for admin and IO commands.
@@ -657,15 +665,30 @@ static inline void pci_epf_nvme_dispatch_cmd(struct pci_epf_nvme_cmd *epcmd);
 static inline void pci_epf_nvme_dispatch_cmd_xfer_first(
 	struct pci_epf_nvme_cmd *epcmd);
 
+#if PCI_EPF_NVME_THREADS
+static int pci_epf_nvme_xfer_wq_fn(void *arg)
+{
+	int ret;
+	struct pci_epf_nvme *epf_nvme = (struct pci_epf_nvme *)arg;
+#else
 static void pci_epf_nvme_xfer_wq_fn(struct work_struct *work)
 {
 	int ret;
 	struct pci_epf_nvme *epf_nvme =
 		container_of(work, struct pci_epf_nvme, xfer_work.work);
+#endif
 	struct pci_epf_nvme_cmd *epcmd;
 
+#if PCI_EPF_NVME_THREADS
+	while(1) {
+		wait_event_interruptible(xfer_wq, !kfifo_is_empty(&epf_nvme->xfer_fifo) ||
+					 epf_nvme->disabled);
+		if (epf_nvme->disabled)
+			return 0;
+#else
 	/* Note this could be implemented with wait_event_interruptible */
 	while (!kfifo_is_empty(&epf_nvme->xfer_fifo)) {
+#endif
 		ret = kfifo_get(&epf_nvme->xfer_fifo, &epcmd);
 		if (ret != 1) {
 			dev_err(&epf_nvme->epf->dev,
@@ -799,15 +822,30 @@ free:
 	pci_epf_nvme_free_cmd(epcmd);
 }
 
+#if PCI_EPF_NVME_THREADS
+static int pci_epf_nvme_completion_wq_fn(void *arg)
+{
+	int ret;
+	struct pci_epf_nvme *epf_nvme = (struct pci_epf_nvme *)arg;
+#else
 static void pci_epf_nvme_completion_wq_fn(struct work_struct *work)
 {
 	int ret;
 	struct pci_epf_nvme *epf_nvme =
 		container_of(work, struct pci_epf_nvme, completion_work.work);
+#endif
 	struct pci_epf_nvme_cmd *epcmd;
 
+#if PCI_EPF_NVME_THREADS
+	while(1) {
+		wait_event_interruptible(cq_wq, !kfifo_is_empty(&epf_nvme->completion_fifo) ||
+					 epf_nvme->disabled);
+		if (epf_nvme->disabled)
+			return 0;
+#else
 	/* Note this could be implemented with wait_event_interruptible */
 	while (!kfifo_is_empty(&epf_nvme->completion_fifo)) {
+#endif
 		ret = kfifo_get(&epf_nvme->completion_fifo, &epcmd);
 		if (ret != 1) {
 			dev_err(&epf_nvme->epf->dev,
@@ -829,6 +867,9 @@ static inline void pci_epf_nvme_queue_response(struct pci_epf_nvme_cmd *epcmd)
 	/* Lock because this is called from multiple threads */
 	kfifo_in_spinlocked(&epcmd->epf_nvme->completion_fifo, &epcmd, 1,
 			    &epcmd->epf_nvme->completion_fifo_lock);
+#if PCI_EPF_NVME_THREADS
+	wake_up(&cq_wq);
+#endif
 }
 
 static struct pci_epf_nvme_cmd *
@@ -1438,8 +1479,16 @@ static void pci_epf_nvme_disable_ctrl(struct pci_epf_nvme *epf_nvme,
 
 	/* Tell all the work that the controller is disabled*/
 	epf_nvme->disabled = true;
+#if PCI_EPF_NVME_THREADS
+	wake_up(&xfer_wq);
+	wake_up(&cq_wq);
+	kthread_stop(xfer_thread);
+	kthread_stop(cq_thread);
+	dev_info(&epf->dev, "Threads joined\n");
+#else
 	cancel_delayed_work_sync(&epf_nvme->xfer_work);
 	cancel_delayed_work_sync(&epf_nvme->completion_work);
+#endif
 
 	/*
 	 * Unmap the submission queues first to release all references
@@ -1527,12 +1576,29 @@ static void pci_epf_nvme_enable_ctrl(struct pci_epf_nvme *epf_nvme)
 	/* Start polling the submission queues */
 	queue_delayed_work(epf_nvme_sq_wq, &epf_nvme->sq_poll,
 			   msecs_to_jiffies(1));
+#if PCI_EPF_NVME_THREADS
+	xfer_thread = kthread_run(pci_epf_nvme_xfer_wq_fn,
+				  (void *)epf_nvme,
+				  "xfer_thread");
+	if (IS_ERR_OR_NULL(xfer_thread)) {
+		dev_err(&epf_nvme->epf->dev, "Error creating xfer thread");
+		return;
+	}
+	cq_thread = kthread_run(pci_epf_nvme_completion_wq_fn,
+				(void *)epf_nvme,
+				"completion_thread");
+	if (IS_ERR_OR_NULL(cq_thread)) {
+		dev_err(&epf_nvme->epf->dev, "Error creating completion thread");
+		return;
+	}
+#else
 	/* Start work for transfers */
 	queue_delayed_work(epf_nvme_sq_wq, &epf_nvme->xfer_work,
 			   msecs_to_jiffies(1));
 	/* Start work for completions */
 	queue_delayed_work(epf_nvme_sq_wq, &epf_nvme->completion_work,
 			   msecs_to_jiffies(1));
+#endif
 
 	return;
 }
@@ -1649,6 +1715,9 @@ static inline void pci_epf_nvme_dispatch_cmd_xfer_first(
 	/* Lock because this is called from multiple threads */
 	kfifo_in_spinlocked(&epcmd->epf_nvme->xfer_fifo, &epcmd, 1,
 			    &epcmd->epf_nvme->xfer_fifo_lock);
+#if PCI_EPF_NVME_THREADS
+	wake_up(&xfer_wq);
+#endif
 }
 
 static void pci_epf_nvme_admin_create_cq(struct pci_epf_nvme *epf_nvme,
@@ -2400,11 +2469,15 @@ static int pci_epf_nvme_probe(struct pci_epf *epf,
 	epf_nvme->epf = epf;
 	INIT_DELAYED_WORK(&epf_nvme->reg_poll, pci_epf_nvme_reg_poll);
 	INIT_DELAYED_WORK(&epf_nvme->sq_poll, pci_epf_nvme_sq_poll);
+#if PCI_EPF_NVME_THREADS
+	dev_info(&epf_nvme->epf->dev, "Version with threads\n");
+#else
 	INIT_DELAYED_WORK(&epf_nvme->xfer_work, pci_epf_nvme_xfer_wq_fn);
 	INIT_DELAYED_WORK(&epf_nvme->completion_work,
 			  pci_epf_nvme_completion_wq_fn);
 
 	dev_info(&epf_nvme->epf->dev, "Version with workqueues\n");
+#endif
 
 	epf_nvme->prp_list_buf = devm_kzalloc(&epf->dev, NVME_CTRL_PAGE_SIZE,
 					      GFP_KERNEL);
