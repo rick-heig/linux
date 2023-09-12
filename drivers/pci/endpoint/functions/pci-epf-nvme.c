@@ -96,6 +96,7 @@ struct pci_epf_nvme_queue {
 	struct pci_epc_map	map;
 
 	struct nvme_command	*local_queue;
+	u16			local_tail;
 };
 
 struct pci_epf_nvme;
@@ -554,6 +555,7 @@ static void pci_epf_nvme_init_cmd(struct pci_epf_nvme *epf_nvme,
 				  struct pci_epf_nvme_cmd *epcmd,
 				  int sqid, int cqid)
 {
+	atomic_inc(&epf_nvme->in_flight_commands);
 	memset(epcmd, 0, sizeof(*epcmd));
 	epcmd->epf_nvme = epf_nvme;
 	epcmd->sqid = sqid;
@@ -874,6 +876,43 @@ static inline void pci_epf_nvme_queue_response(struct pci_epf_nvme_cmd *epcmd)
 #endif
 }
 
+static inline int pci_epf_nvme_fetch_sqes(struct pci_epf_nvme *epf_nvme, int qid)
+{
+	struct pci_epf_nvme_ctrl *ctrl = &epf_nvme->ctrl;
+	struct pci_epf_nvme_queue *sq = &ctrl->sq[qid];
+	int num_cmds;
+
+	if (!sq->size)
+		return 0;
+
+	sq->tail = pci_epf_nvme_reg_read32(ctrl, sq->db);
+	if (sq->tail == sq->head) {
+		/* Queue empty */
+		return 0;
+	}
+
+	/* If the queue has wrapped */
+	if (sq->tail < sq->head) {
+		/* Transfer all SQEs to edge end of the queue without wrap */
+		num_cmds = sq->depth - sq->head;
+		memcpy_fromio(&sq->local_queue[sq->head],
+			      sq->map.virt_addr +
+				sq->head * sizeof(struct nvme_command),
+			      num_cmds * sizeof(struct nvme_command));
+		sq->local_tail = 0;
+	} else {
+		/* Transfer all SQEs from host queue to local queue */
+		num_cmds = sq->tail - sq->head;
+		memcpy_fromio(&sq->local_queue[sq->head],
+			      sq->map.virt_addr +
+				sq->head * sizeof(struct nvme_command),
+			      num_cmds * sizeof(struct nvme_command));
+		sq->local_tail = sq->tail;
+	}
+
+	return num_cmds;
+}
+
 static struct pci_epf_nvme_cmd *
 pci_epf_nvme_fetch_cmd(struct pci_epf_nvme *epf_nvme, int qid)
 {
@@ -893,8 +932,6 @@ pci_epf_nvme_fetch_cmd(struct pci_epf_nvme *epf_nvme, int qid)
 	epcmd = pci_epf_nvme_alloc_cmd(epf_nvme);
 	if (!epcmd)
 		return NULL;
-
-	atomic_inc(&epf_nvme->in_flight_commands);
 
 	/* Get the NVMe command submitted by the host */
 	pci_epf_nvme_init_cmd(epf_nvme, epcmd, sq->qid, sq->cqid);
@@ -1305,6 +1342,7 @@ static int pci_epf_nvme_map_sq(struct pci_epf_nvme *epf_nvme, int qid,
 
 	sq->local_queue = kmalloc(sq->depth * sizeof(struct nvme_command),
 				  GFP_KERNEL);
+	sq->local_tail = 0;
 
 	if (!sq->local_queue) {
 		dev_err(&epf->dev, "Couldn't allocate space for local queue\n");
@@ -1856,21 +1894,14 @@ static void pci_epf_nvme_admin_identify_hook(struct pci_epf_nvme *epf_nvme,
 	id->sgls = 0;
 }
 
-static bool pci_epf_nvme_process_admin_cmd(struct pci_epf_nvme *epf_nvme)
+static bool pci_epf_nvme_process_admin_cmd(struct pci_epf_nvme_cmd *epcmd)
 {
 	void (*post_process_hook)(struct pci_epf_nvme *,
 				  struct pci_epf_nvme_cmd *) = NULL;
-	struct pci_epf_nvme_cmd *epcmd;
-	struct nvme_command *cmd;
+	struct pci_epf_nvme *epf_nvme = epcmd->epf_nvme;
+	struct nvme_command *cmd = epcmd->cmd;
 	size_t transfer_len = 0;
 	int ret = 0;
-
-	/* Fetch new command from admin submission queue */
-	epcmd = pci_epf_nvme_fetch_cmd(epf_nvme, 0);
-	if (!epcmd)
-		return false;
-
-	cmd = epcmd->cmd;
 
 	switch (cmd->common.opcode) {
 	case nvme_admin_identify:
@@ -1952,19 +1983,15 @@ static inline size_t pci_epf_nvme_rw_data_len(struct pci_epf_nvme_cmd *epcmd)
 		epcmd->ns->lba_shift;
 }
 
-static bool pci_epf_nvme_process_io_cmd(struct pci_epf_nvme *epf_nvme, int qid)
+void pci_epf_nvme_process_io_cmd(struct pci_epf_nvme_cmd *epcmd)
 {
-	struct pci_epf_nvme_cmd *epcmd;
-	struct nvme_command *cmd;
+	struct pci_epf_nvme *epf_nvme = epcmd->epf_nvme;
+	struct nvme_command *cmd = epcmd->cmd;
 	size_t transfer_len = 0;
 	int ret;
 
-	/* Fetch new command from IO submission queue */
-	epcmd = pci_epf_nvme_fetch_cmd(epf_nvme, qid);
-	if (!epcmd)
-		return false;
-
-	cmd = epcmd->cmd;
+	if (!epcmd) /* Should not happen */
+		return;
 
 	/* Get the command target namespace */
 	epcmd->ns = nvme_find_get_ns(epf_nvme->ctrl.ctrl,
@@ -2016,16 +2043,47 @@ static bool pci_epf_nvme_process_io_cmd(struct pci_epf_nvme *epf_nvme, int qid)
 		if (epcmd->dir == DMA_FROM_DEVICE) {
 			/* dispatch means we don't have to handle cmd anymore */
 			pci_epf_nvme_dispatch_cmd_xfer_first(epcmd);
-			return true;
+			return;
 		}
 	}
 
 	pci_epf_nvme_dispatch_cmd(epcmd);
-	return true;
+	return;
 
 complete:
 	pci_epf_nvme_queue_response(epcmd);
-	return true;
+	return;
+}
+
+static bool pci_epf_nvme_process_cmds(struct pci_epf_nvme *epf_nvme, int qid)
+{
+	struct pci_epf_nvme_ctrl *ctrl = &epf_nvme->ctrl;
+	struct pci_epf_nvme_queue *sq = &ctrl->sq[qid];
+	struct pci_epf_nvme_cmd *epcmd;
+	int num_cmds = pci_epf_nvme_fetch_sqes(epf_nvme, qid);
+
+	if (!num_cmds)
+		return false; /* No work to do */
+
+	/* While there are commands in the local queue, proccess them */
+	while (sq->head != sq->local_tail) {
+		do {
+			epcmd = pci_epf_nvme_alloc_cmd(epf_nvme);
+			if (!epcmd) /* No space in cache, retry later */
+				usleep_range(10, 100);
+		} while (!epcmd);
+		pci_epf_nvme_init_cmd(epf_nvme, epcmd, sq->qid, sq->cqid);
+		epcmd->cmd = &sq->local_queue[sq->head];
+		sq->head++;
+		if (sq->head == sq->depth)
+			sq->head = 0;
+		if (qid)
+			pci_epf_nvme_process_io_cmd(epcmd);
+		else
+			pci_epf_nvme_process_admin_cmd(epcmd);
+	}
+
+	return sq->head != sq->tail; /* Work left to do */
 }
 
 static void pci_epf_nvme_sq_poll(struct work_struct *work)
@@ -2033,15 +2091,14 @@ static void pci_epf_nvme_sq_poll(struct work_struct *work)
 	struct pci_epf_nvme *epf_nvme =
 		container_of(work, struct pci_epf_nvme, sq_poll.work);
 	struct pci_epf_nvme_ctrl *ctrl = &epf_nvme->ctrl;
-	bool did_work = true;
+	bool work_to_do = true;
 	int qid;
 
 	/* Process pending commands, starting with the IO queues */
-	while (did_work && pci_epf_nvme_ctrl_ready(ctrl)) {
-		did_work = false;
-		for (qid = 1; qid < ctrl->nr_queues; qid++)
-			did_work |= pci_epf_nvme_process_io_cmd(epf_nvme, qid);
-		did_work |= pci_epf_nvme_process_admin_cmd(epf_nvme);
+	while (work_to_do && pci_epf_nvme_ctrl_ready(ctrl)) {
+		work_to_do = false;
+		for (qid = 0; qid < ctrl->nr_queues; qid++)
+			work_to_do |= pci_epf_nvme_process_cmds(epf_nvme, qid);
 	}
 
 	if (!pci_epf_nvme_ctrl_ready(ctrl))
@@ -2494,13 +2551,13 @@ static int pci_epf_nvme_probe(struct pci_epf *epf,
 	INIT_DELAYED_WORK(&epf_nvme->reg_poll, pci_epf_nvme_reg_poll);
 	INIT_DELAYED_WORK(&epf_nvme->sq_poll, pci_epf_nvme_sq_poll);
 #if PCI_EPF_NVME_THREADS
-	dev_info(&epf_nvme->epf->dev, "Version with threads\n");
+	dev_info(&epf_nvme->epf->dev, "Version with threads and bulk SQEs\n");
 #else
 	INIT_DELAYED_WORK(&epf_nvme->xfer_work, pci_epf_nvme_xfer_wq_fn);
 	INIT_DELAYED_WORK(&epf_nvme->completion_work,
 			  pci_epf_nvme_completion_wq_fn);
 
-	dev_info(&epf_nvme->epf->dev, "Version with workqueues\n");
+	dev_info(&epf_nvme->epf->dev, "Version with workqueues and bulk SQEs\n");
 #endif
 
 	epf_nvme->prp_list_buf = devm_kzalloc(&epf->dev, NVME_CTRL_PAGE_SIZE,
