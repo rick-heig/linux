@@ -668,6 +668,8 @@ static inline void pci_epf_nvme_queue_response(struct pci_epf_nvme_cmd *epcmd);
 static inline void pci_epf_nvme_dispatch_cmd(struct pci_epf_nvme_cmd *epcmd);
 static inline void pci_epf_nvme_dispatch_cmd_xfer_first(
 	struct pci_epf_nvme_cmd *epcmd);
+static int pci_epf_nvme_cmd_parse_dptr(struct pci_epf_nvme *epf_nvme,
+				       struct pci_epf_nvme_cmd *epcmd);
 
 #if PCI_EPF_NVME_THREADS
 static int pci_epf_nvme_xfer_wq_fn(void *arg)
@@ -699,14 +701,21 @@ static void pci_epf_nvme_xfer_wq_fn(struct work_struct *work)
 			        "Could not get element from completion FIFO\n");
 		}
 
-		if (epcmd->dir == DMA_NONE || epcmd->dir == DMA_BIDIRECTIONAL) {
+		if (!epcmd->transfer_len || epcmd->dir == DMA_NONE ||
+		    epcmd->dir == DMA_BIDIRECTIONAL) {
 			epcmd->status = NVME_SC_INTERNAL | NVME_SC_DNR;
 			pci_epf_nvme_queue_response(epcmd);
 			continue;
 		}
 
-		ret = pci_epf_nvme_cmd_transfer(epf_nvme, epcmd, epcmd->dir);
+		/* Get the host buffer segments */
+		ret = pci_epf_nvme_cmd_parse_dptr(epf_nvme, epcmd);
+		if (ret) {
+			pci_epf_nvme_queue_response(epcmd);
+			continue;
+		}
 
+		ret = pci_epf_nvme_cmd_transfer(epf_nvme, epcmd, epcmd->dir);
 		if (ret) {
 			pci_epf_nvme_queue_response(epcmd);
 			continue;
@@ -973,7 +982,7 @@ static int pci_epf_nvme_get_prp_list(struct pci_epf_nvme *epf_nvme, u64 prp,
 	seg.pci_addr = prp;
 	seg.size = min(pci_epf_nvme_prp_size(ctrl, prp), nr_prps << 3);
 	ret = pci_epf_nvme_transfer(epf_nvme, &seg, DMA_FROM_DEVICE,
-				    epf_nvme->prp_list_buf, true /* no_dma */);
+				    epf_nvme->prp_list_buf, false /* no_dma */);
 	if (ret)
 		return ret;
 
@@ -1183,13 +1192,6 @@ static int pci_epf_nvme_cmd_parse_dptr(struct pci_epf_nvme *epf_nvme,
 		ret = pci_epf_nvme_cmd_parse_prp_list(epf_nvme, epcmd);
 	if (ret)
 		return ret;
-
-	/* Get an internal buffer for the command */
-	ret = pci_epf_nvme_alloc_cmd_buffer(epcmd);
-	if (ret) {
-		epcmd->status = NVME_SC_INTERNAL | NVME_SC_DNR;
-		return ret;
-	}
 
 	return 0;
 
@@ -1944,10 +1946,12 @@ static void pci_epf_nvme_process_admin_cmd(struct pci_epf_nvme_cmd *epcmd)
 	}
 
 	if (epcmd->transfer_len) {
-		/* Get the host buffer segments and an internal buffer */
-		ret = pci_epf_nvme_cmd_parse_dptr(epf_nvme, epcmd);
-		if (ret)
+		/* Get an internal buffer for the command */
+		ret = pci_epf_nvme_alloc_cmd_buffer(epcmd);
+		if (ret) {
+			epcmd->status = NVME_SC_INTERNAL | NVME_SC_DNR;
 			goto complete;
+		}
 	}
 
 	/* Note this could also be dispatched */
@@ -1978,7 +1982,7 @@ void pci_epf_nvme_process_io_cmd(struct pci_epf_nvme_cmd *epcmd)
 {
 	struct pci_epf_nvme *epf_nvme = epcmd->epf_nvme;
 	struct nvme_command *cmd = epcmd->cmd;
-	int ret;
+	int ret = 0;
 
 	if (!epcmd) /* Should not happen */
 		return;
@@ -2023,10 +2027,12 @@ void pci_epf_nvme_process_io_cmd(struct pci_epf_nvme_cmd *epcmd)
 	}
 
 	if (epcmd->transfer_len) {
-		/* Get the host buffer segments and an internal buffer */
-		ret = pci_epf_nvme_cmd_parse_dptr(epf_nvme, epcmd);
-		if (ret)
+		/* Get an internal buffer for the command */
+		ret = pci_epf_nvme_alloc_cmd_buffer(epcmd);
+		if (ret) {
+			epcmd->status = NVME_SC_INTERNAL | NVME_SC_DNR;
 			goto complete;
+		}
 
 		/* Get data from the host if needed */
 		if (epcmd->dir == DMA_FROM_DEVICE) {
