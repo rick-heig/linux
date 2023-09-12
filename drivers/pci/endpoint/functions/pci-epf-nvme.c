@@ -1889,7 +1889,7 @@ static void pci_epf_nvme_admin_identify_hook(struct pci_epf_nvme *epf_nvme,
 	id->sgls = 0;
 }
 
-static bool pci_epf_nvme_process_admin_cmd(struct pci_epf_nvme_cmd *epcmd)
+static void pci_epf_nvme_process_admin_cmd(struct pci_epf_nvme_cmd *epcmd)
 {
 	void (*post_process_hook)(struct pci_epf_nvme *,
 				  struct pci_epf_nvme_cmd *) = NULL;
@@ -1914,7 +1914,7 @@ static bool pci_epf_nvme_process_admin_cmd(struct pci_epf_nvme_cmd *epcmd)
 	case nvme_admin_async_event:
 		/* XXX For now XXX */
 		dev_info(&epf_nvme->epf->dev, "nvme_admin_async_event\n");
-		return true;
+		return;
 
 	case nvme_admin_get_features:
 		/* XXX TODO XXX */
@@ -1961,13 +1961,11 @@ static bool pci_epf_nvme_process_admin_cmd(struct pci_epf_nvme_cmd *epcmd)
 	if (epcmd->transfer_len) {
 		/* Dispatch means we don't have to handle the cmd anymore */
 		pci_epf_nvme_dispatch_cmd_xfer_first(epcmd);
-		return true;
+		return;
 	}
 
 complete:
 	pci_epf_nvme_queue_response(epcmd);
-
-	return true;
 }
 
 static inline size_t pci_epf_nvme_rw_data_len(struct pci_epf_nvme_cmd *epcmd)
