@@ -156,6 +156,7 @@ struct pci_epf_nvme_cmd {
 	enum dma_data_direction		dir;
 	bool				executed;
 	bool				pending_xfer_to_host;
+	size_t				transfer_len;
 
 	/* Internal buffer that we will transfer over PCI */
 	size_t				buffer_size;
@@ -564,17 +565,16 @@ static void pci_epf_nvme_init_cmd(struct pci_epf_nvme *epf_nvme,
 	/* executed, pending_xfer_to_host set to 0 by memset */
 }
 
-static int pci_epf_nvme_alloc_cmd_buffer(struct pci_epf_nvme_cmd *epcmd,
-					 size_t size)
+static int pci_epf_nvme_alloc_cmd_buffer(struct pci_epf_nvme_cmd *epcmd)
 {
 	void *buffer;
 
-	buffer = kvzalloc(size, GFP_KERNEL);
+	buffer = kvzalloc(epcmd->transfer_len, GFP_KERNEL);
 	if (!buffer)
 		return -ENOMEM;
 
 	epcmd->buffer = buffer;
-	epcmd->buffer_size = size;
+	epcmd->buffer_size = epcmd->transfer_len;
 
 	return 0;
 }
@@ -981,8 +981,7 @@ static int pci_epf_nvme_get_prp_list(struct pci_epf_nvme *epf_nvme, u64 prp,
 }
 
 static int pci_epf_nvme_cmd_parse_prp_list(struct pci_epf_nvme *epf_nvme,
-					   struct pci_epf_nvme_cmd *epcmd,
-					   size_t transfer_len)
+					   struct pci_epf_nvme_cmd *epcmd)
 {
 	struct pci_epf_nvme_ctrl *ctrl = &epf_nvme->ctrl;
 	struct nvme_command *cmd = epcmd->cmd;
@@ -1004,7 +1003,7 @@ static int pci_epf_nvme_cmd_parse_prp_list(struct pci_epf_nvme *epf_nvme,
 	if (!prp)
 		goto invalid_field;
 
-	nr_segs = (transfer_len + ofst + NVME_CTRL_PAGE_SIZE - 1)
+	nr_segs = (epcmd->transfer_len + ofst + NVME_CTRL_PAGE_SIZE - 1)
 		>> NVME_CTRL_PAGE_SHIFT;
 
 	ret = pci_epf_nvme_alloc_cmd_segs(epcmd, nr_segs);
@@ -1029,8 +1028,8 @@ static int pci_epf_nvme_cmd_parse_prp_list(struct pci_epf_nvme *epf_nvme,
 	if (!prp)
 		goto invalid_field;
 
-	while (size < transfer_len) {
-		xfer_len = transfer_len - size;
+	while (size < epcmd->transfer_len) {
+		xfer_len = epcmd->transfer_len - size;
 
 		if (!nr_prps) {
 			/* Get the prp list */
@@ -1082,10 +1081,10 @@ static int pci_epf_nvme_cmd_parse_prp_list(struct pci_epf_nvme *epf_nvme,
 	epcmd->nr_segs = nr_segs;
 	ret = 0;
 
-	if (size != transfer_len) {
+	if (size != epcmd->transfer_len) {
 		dev_err(&epf_nvme->epf->dev,
 			"PRPs transfer length mismatch %zu / %zu\n",
-			size, transfer_len);
+			size, epcmd->transfer_len);
 		goto internal;
 	}
 
@@ -1105,8 +1104,7 @@ invalid_field:
 }
 
 static int pci_epf_nvme_cmd_parse_prp_simple(struct pci_epf_nvme *epf_nvme,
-					     struct pci_epf_nvme_cmd *epcmd,
-					     size_t transfer_len)
+					     struct pci_epf_nvme_cmd *epcmd)
 {
 	struct pci_epf_nvme_ctrl *ctrl = &epf_nvme->ctrl;
 	struct nvme_command *cmd = epcmd->cmd;
@@ -1119,7 +1117,7 @@ static int pci_epf_nvme_cmd_parse_prp_simple(struct pci_epf_nvme *epf_nvme,
 	prp1_size = pci_epf_nvme_prp_size(ctrl, prp1);
 
 	/* For commands crossing a page boundary, we should have a valid prp2 */
-	if (transfer_len > prp1_size) {
+	if (epcmd->transfer_len > prp1_size) {
 		prp2 = le64_to_cpu(cmd->common.dptr.prp2);
 		if (!prp2)
 			goto invalid_field;
@@ -1136,11 +1134,11 @@ static int pci_epf_nvme_cmd_parse_prp_simple(struct pci_epf_nvme *epf_nvme,
 
 	epcmd->segs[0].pci_addr = prp1;
 	if (nr_segs == 1) {
-		epcmd->segs[0].size = transfer_len;
+		epcmd->segs[0].size = epcmd->transfer_len;
 	} else {
 		epcmd->segs[0].size = prp1_size;
 		epcmd->segs[1].pci_addr = prp2;
-		epcmd->segs[1].size = transfer_len - prp1_size;
+		epcmd->segs[1].size = epcmd->transfer_len - prp1_size;
 	}
 
 	return 0;
@@ -1159,8 +1157,7 @@ internal:
 }
 
 static int pci_epf_nvme_cmd_parse_dptr(struct pci_epf_nvme *epf_nvme,
-				       struct pci_epf_nvme_cmd *epcmd,
-				       size_t transfer_len)
+				       struct pci_epf_nvme_cmd *epcmd)
 {
 	struct pci_epf_nvme_ctrl *ctrl = &epf_nvme->ctrl;
 	struct nvme_command *cmd = epcmd->cmd;
@@ -1168,7 +1165,7 @@ static int pci_epf_nvme_cmd_parse_dptr(struct pci_epf_nvme *epf_nvme,
 	size_t ofst;
 	int ret;
 
-	if (transfer_len > PCI_EPF_NVME_MDTS)
+	if (epcmd->transfer_len > PCI_EPF_NVME_MDTS)
 		goto invalid_field;
 
 	/* We do not support SGL for now */
@@ -1180,17 +1177,15 @@ static int pci_epf_nvme_cmd_parse_dptr(struct pci_epf_nvme *epf_nvme,
 	if (ofst & 0x3)
 		goto invalid_offset;
 
-	if (transfer_len + ofst <= NVME_CTRL_PAGE_SIZE * 2)
-		ret = pci_epf_nvme_cmd_parse_prp_simple(epf_nvme, epcmd,
-						        transfer_len);
+	if (epcmd->transfer_len + ofst <= NVME_CTRL_PAGE_SIZE * 2)
+		ret = pci_epf_nvme_cmd_parse_prp_simple(epf_nvme, epcmd);
 	else
-		ret = pci_epf_nvme_cmd_parse_prp_list(epf_nvme, epcmd,
-						      transfer_len);
+		ret = pci_epf_nvme_cmd_parse_prp_list(epf_nvme, epcmd);
 	if (ret)
 		return ret;
 
 	/* Get an internal buffer for the command */
-	ret = pci_epf_nvme_alloc_cmd_buffer(epcmd, transfer_len);
+	ret = pci_epf_nvme_alloc_cmd_buffer(epcmd);
 	if (ret) {
 		epcmd->status = NVME_SC_INTERNAL | NVME_SC_DNR;
 		return ret;
@@ -1900,19 +1895,18 @@ static bool pci_epf_nvme_process_admin_cmd(struct pci_epf_nvme_cmd *epcmd)
 				  struct pci_epf_nvme_cmd *) = NULL;
 	struct pci_epf_nvme *epf_nvme = epcmd->epf_nvme;
 	struct nvme_command *cmd = epcmd->cmd;
-	size_t transfer_len = 0;
 	int ret = 0;
 
 	switch (cmd->common.opcode) {
 	case nvme_admin_identify:
 		post_process_hook = pci_epf_nvme_admin_identify_hook;
-		transfer_len = NVME_IDENTIFY_DATA_SIZE;
+		epcmd->transfer_len = NVME_IDENTIFY_DATA_SIZE;
 		epcmd->pending_xfer_to_host = true;
 		epcmd->dir = DMA_TO_DEVICE;
 		break;
 
 	case nvme_admin_get_log_page:
-		transfer_len = nvme_get_log_page_len(cmd);
+		epcmd->transfer_len = nvme_get_log_page_len(cmd);
 		epcmd->pending_xfer_to_host = true;
 		epcmd->dir = DMA_TO_DEVICE;
 		break;
@@ -1949,10 +1943,9 @@ static bool pci_epf_nvme_process_admin_cmd(struct pci_epf_nvme_cmd *epcmd)
 		goto complete;
 	}
 
-	if (transfer_len) {
+	if (epcmd->transfer_len) {
 		/* Get the host buffer segments and an internal buffer */
-		ret = pci_epf_nvme_cmd_parse_dptr(epf_nvme, epcmd,
-						  transfer_len);
+		ret = pci_epf_nvme_cmd_parse_dptr(epf_nvme, epcmd);
 		if (ret)
 			goto complete;
 	}
@@ -1965,7 +1958,7 @@ static bool pci_epf_nvme_process_admin_cmd(struct pci_epf_nvme_cmd *epcmd)
 	/* Command done: post process it and transfer data if needed */
 	if (post_process_hook)
 		post_process_hook(epf_nvme, epcmd);
-	if (transfer_len) {
+	if (epcmd->transfer_len) {
 		/* Dispatch means we don't have to handle the cmd anymore */
 		pci_epf_nvme_dispatch_cmd_xfer_first(epcmd);
 		return true;
@@ -1987,7 +1980,6 @@ void pci_epf_nvme_process_io_cmd(struct pci_epf_nvme_cmd *epcmd)
 {
 	struct pci_epf_nvme *epf_nvme = epcmd->epf_nvme;
 	struct nvme_command *cmd = epcmd->cmd;
-	size_t transfer_len = 0;
 	int ret;
 
 	if (!epcmd) /* Should not happen */
@@ -2003,18 +1995,18 @@ void pci_epf_nvme_process_io_cmd(struct pci_epf_nvme_cmd *epcmd)
 
 	switch (cmd->common.opcode) {
 	case nvme_cmd_read:
-		transfer_len = pci_epf_nvme_rw_data_len(epcmd);
+		epcmd->transfer_len = pci_epf_nvme_rw_data_len(epcmd);
 		epcmd->pending_xfer_to_host = true;
 		epcmd->dir = DMA_TO_DEVICE;
 		break;
 
 	case nvme_cmd_write:
-		transfer_len = pci_epf_nvme_rw_data_len(epcmd);
+		epcmd->transfer_len = pci_epf_nvme_rw_data_len(epcmd);
 		epcmd->dir = DMA_FROM_DEVICE;
 		break;
 
 	case nvme_cmd_dsm:
-		transfer_len = (le32_to_cpu(cmd->dsm.nr) + 1) *
+		epcmd->transfer_len = (le32_to_cpu(cmd->dsm.nr) + 1) *
 			sizeof(struct nvme_dsm_range);
 		epcmd->dir = DMA_FROM_DEVICE;
 		goto complete;
@@ -2032,10 +2024,9 @@ void pci_epf_nvme_process_io_cmd(struct pci_epf_nvme_cmd *epcmd)
 		goto complete;
 	}
 
-	if (transfer_len) {
+	if (epcmd->transfer_len) {
 		/* Get the host buffer segments and an internal buffer */
-		ret = pci_epf_nvme_cmd_parse_dptr(epf_nvme, epcmd,
-						  transfer_len);
+		ret = pci_epf_nvme_cmd_parse_dptr(epf_nvme, epcmd);
 		if (ret)
 			goto complete;
 
