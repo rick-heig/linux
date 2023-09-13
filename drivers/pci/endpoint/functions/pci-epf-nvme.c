@@ -35,6 +35,11 @@
 #define PCI_EPF_NVME_THREADS 1
 
 /*
+ * Maximum number of DMAs
+ */
+#define PCI_EPF_NVME_MAX_DMA 1
+
+/*
  * Time to (busy) wait in microseconds if the completion queue is full
  */
 #define PCI_EPF_NVME_CQ_FULL_DELAY_US 10
@@ -171,6 +176,20 @@ struct pci_epf_nvme_cmd {
 	struct pci_epf_nvme_segment	seg;
 	struct pci_epf_nvme_segment	*segs;
 };
+/*
+ * DMA fields
+ */
+struct pci_epf_nvme_dma {
+	bool				dma_supported;
+	bool				dma_private;
+	struct dma_chan			*dma_chan_tx;
+	struct dma_chan			*dma_chan_rx;
+	struct dma_chan			*dma_chan;
+	struct device			*dma_dev;
+	dma_cookie_t			dma_cookie;
+	enum dma_status			dma_status;
+	struct completion		dma_complete;
+};
 
 /*
  * EPF function private data representing our NVMe subsystem.
@@ -188,15 +207,7 @@ struct pci_epf_nvme {
 
 	__le64				*prp_list_buf;
 
-        bool				dma_supported;
-        bool				dma_private;
-	struct dma_chan			*dma_chan_tx;
-        struct dma_chan			*dma_chan_rx;
-        struct dma_chan			*dma_chan;
-	struct device			*dma_dev;
-        dma_cookie_t			dma_cookie;
-        enum dma_status			dma_status;
-        struct completion		dma_complete;
+	struct pci_epf_nvme_dma		dmas[PCI_EPF_NVME_MAX_DMA];
 
 	struct delayed_work		reg_poll;
 	struct delayed_work		sq_poll;
@@ -279,7 +290,8 @@ static bool pci_epf_nvme_dma_filter(struct dma_chan *chan, void *arg)
                (filter->dma_mask & caps.directions);
 }
 
-static bool pci_epf_nvme_init_dma(struct pci_epf_nvme *epf_nvme)
+static bool pci_epf_nvme_init_dma(struct pci_epf_nvme *epf_nvme,
+				  struct pci_epf_nvme_dma *dma)
 {
 	struct pci_epf *epf = epf_nvme->epf;
 	struct device *dev = &epf->dev;
@@ -288,39 +300,39 @@ static bool pci_epf_nvme_init_dma(struct pci_epf_nvme *epf_nvme)
 	dma_cap_mask_t mask;
 	int ret;
 
-	epf_nvme->dma_dev = epf_nvme->epf->epc->dev.parent;
-	init_completion(&epf_nvme->dma_complete);
+	dma->dma_dev = epf_nvme->epf->epc->dev.parent;
+	init_completion(&dma->dma_complete);
 
 	dma_cap_zero(mask);
 	dma_cap_set(DMA_SLAVE, mask);
 
-	filter.dev = epf_nvme->dma_dev;
+	filter.dev = dma->dma_dev;
 	filter.dma_mask = BIT(DMA_DEV_TO_MEM);
 	chan = dma_request_channel(mask, pci_epf_nvme_dma_filter, &filter);
 	if (!chan)
 		goto generic;
-	epf_nvme->dma_chan_rx = chan;
+	dma->dma_chan_rx = chan;
 
 	filter.dma_mask = BIT(DMA_MEM_TO_DEV);
 	chan = dma_request_channel(mask, pci_epf_nvme_dma_filter, &filter);
 	if (!chan)
 		goto release_rx;
-	epf_nvme->dma_chan_tx = chan;
+	dma->dma_chan_tx = chan;
 
 	dev_info(dev, "DMA RX channel %s: maximum segment size %d B\n",
-		 dma_chan_name(epf_nvme->dma_chan_rx),
-		 dma_get_max_seg_size(epf_nvme->dma_chan_rx->device->dev));
+		 dma_chan_name(dma->dma_chan_rx),
+		 dma_get_max_seg_size(dma->dma_chan_rx->device->dev));
 	dev_info(dev, "DMA TX channel %s: maximum segment size %d B\n",
-		 dma_chan_name(epf_nvme->dma_chan_tx),
-		 dma_get_max_seg_size(epf_nvme->dma_chan_tx->device->dev));
+		 dma_chan_name(dma->dma_chan_tx),
+		 dma_get_max_seg_size(dma->dma_chan_tx->device->dev));
 
-	epf_nvme->dma_private = true;
+	dma->dma_private = true;
 
 	return true;
 
 release_rx:
-	dma_release_channel(epf_nvme->dma_chan_rx);
-	epf_nvme->dma_chan_rx = NULL;
+	dma_release_channel(dma->dma_chan_rx);
+	dma->dma_chan_rx = NULL;
 
 generic:
 	/* Fallback to a generic memcpy channel if we have one */
@@ -338,45 +350,47 @@ generic:
 		 dma_chan_name(chan),
 		 dma_get_max_seg_size(chan->device->dev));
 
-	epf_nvme->dma_chan_tx = chan;
-	epf_nvme->dma_chan_rx = chan;
+	dma->dma_chan_tx = chan;
+	dma->dma_chan_rx = chan;
 
 	return true;
 }
 
-static void pci_epf_nvme_clean_dma(struct pci_epf_nvme *epf_nvme)
+static void pci_epf_nvme_clean_dma(struct pci_epf_nvme *epf_nvme,
+				   struct pci_epf_nvme_dma *dma)
 {
-	if (!epf_nvme->dma_supported)
+	if (!dma->dma_supported)
 		return;
 
-	dma_release_channel(epf_nvme->dma_chan_tx);
-	if (epf_nvme->dma_chan_rx != epf_nvme->dma_chan_tx)
-		dma_release_channel(epf_nvme->dma_chan_rx);
+	dma_release_channel(dma->dma_chan_tx);
+	if (dma->dma_chan_rx != dma->dma_chan_tx)
+		dma_release_channel(dma->dma_chan_rx);
 
-	epf_nvme->dma_chan_tx = NULL;
-	epf_nvme->dma_chan_rx = NULL;
-	epf_nvme->dma_chan = NULL;
-	epf_nvme->dma_supported = false;
+	dma->dma_chan_tx = NULL;
+	dma->dma_chan_rx = NULL;
+	dma->dma_chan = NULL;
+	dma->dma_supported = false;
 }
 
 static void pci_epf_nvme_dma_callback(void *param)
 {
-        struct pci_epf_nvme *epf_nvme = param;
+        struct pci_epf_nvme_dma *dma = param;
         struct dma_tx_state state;
 	enum dma_status status;
 
-        status = dmaengine_tx_status(epf_nvme->dma_chan,
-				     epf_nvme->dma_cookie, &state);
+        status = dmaengine_tx_status(dma->dma_chan,
+				     dma->dma_cookie, &state);
 	if (status == DMA_COMPLETE || status == DMA_ERROR) {
-		epf_nvme->dma_status = status;
-		complete(&epf_nvme->dma_complete);
+		dma->dma_status = status;
+		complete(&dma->dma_complete);
 	}
 }
 
-static int pci_epf_nvme_dma(struct pci_epf_nvme *epf_nvme,
-			    dma_addr_t dma_dst, dma_addr_t dma_src,
-			    size_t len, dma_addr_t dma_remote,
-			    enum dma_transfer_direction dir)
+static int pci_epf_nvme_do_dma(struct pci_epf_nvme *epf_nvme,
+			      struct pci_epf_nvme_dma *dma,
+			      dma_addr_t dma_dst, dma_addr_t dma_src,
+			      size_t len, dma_addr_t dma_remote,
+			      enum dma_transfer_direction dir)
 {
 	struct dma_async_tx_descriptor *tx;
 	struct dma_slave_config sconf = {};
@@ -386,18 +400,18 @@ static int pci_epf_nvme_dma(struct pci_epf_nvme *epf_nvme,
 	int ret;
 
 	if (dir == DMA_DEV_TO_MEM) {
-		chan = epf_nvme->dma_chan_tx;
+		chan = dma->dma_chan_tx;
 		dma_local = dma_dst;
 	} else {
 		dma_local = dma_src;
-		chan = epf_nvme->dma_chan_rx;
+		chan = dma->dma_chan_rx;
 	}
 	if (IS_ERR_OR_NULL(chan)) {
 		dev_err(&epf_nvme->epf->dev, "Invalid DMA channel\n");
 		return -EINVAL;
 	}
 
-	if (epf_nvme->dma_private) {
+	if (dma->dma_private) {
 		sconf.direction = dir;
 		if (dir == DMA_MEM_TO_DEV)
 			sconf.dst_addr = dma_remote;
@@ -421,13 +435,13 @@ static int pci_epf_nvme_dma(struct pci_epf_nvme *epf_nvme,
 		return -EIO;
 	}
 
-	reinit_completion(&epf_nvme->dma_complete);
-	epf_nvme->dma_chan = chan;
+	reinit_completion(&dma->dma_complete);
+	dma->dma_chan = chan;
 	tx->callback = pci_epf_nvme_dma_callback;
-	tx->callback_param = epf_nvme;
-	epf_nvme->dma_cookie = dmaengine_submit(tx);
+	tx->callback_param = dma;
+	dma->dma_cookie = dmaengine_submit(tx);
 
-	ret = dma_submit_error(epf_nvme->dma_cookie);
+	ret = dma_submit_error(dma->dma_cookie);
 	if (ret) {
 		dev_err(&epf_nvme->epf->dev, "DMA tx_submit failed %d\n", ret);
 		goto terminate;
@@ -435,7 +449,7 @@ static int pci_epf_nvme_dma(struct pci_epf_nvme *epf_nvme,
 
 	dma_async_issue_pending(chan);
 
-	time_left = wait_for_completion_timeout(&epf_nvme->dma_complete,
+	time_left = wait_for_completion_timeout(&dma->dma_complete,
 						HZ * 10);
 	if (!time_left) {
 		dev_err(&epf_nvme->epf->dev, "DMA transfer timeout\n");
@@ -443,7 +457,7 @@ static int pci_epf_nvme_dma(struct pci_epf_nvme *epf_nvme,
 		goto terminate;
 	}
 
-	if (epf_nvme->dma_status != DMA_COMPLETE) {
+	if (dma->dma_status != DMA_COMPLETE) {
 		dev_err(&epf_nvme->epf->dev, "DMA transfer failed\n");
 		ret = -EIO;
 	}
@@ -456,14 +470,15 @@ terminate:
 }
 
 static int pci_epf_nvme_dma_transfer(struct pci_epf_nvme *epf_nvme,
+				     struct pci_epf_nvme_dma *dma,
 				     struct pci_epc_map *map,
 				     void *buf, enum dma_data_direction dir)
 {
 	phys_addr_t dma_phys_addr;
 	int ret;
 
-	dma_phys_addr = dma_map_single(epf_nvme->dma_dev, buf, map->size, dir);
-	if (dma_mapping_error(epf_nvme->dma_dev, dma_phys_addr)) {
+	dma_phys_addr = dma_map_single(dma->dma_dev, buf, map->size, dir);
+	if (dma_mapping_error(dma->dma_dev, dma_phys_addr)) {
 		dev_err(&epf_nvme->epf->dev,
 			"Failed to map source buffer addr\n");
 		return -ENOMEM;
@@ -471,20 +486,20 @@ static int pci_epf_nvme_dma_transfer(struct pci_epf_nvme *epf_nvme,
 
 	switch (dir) {
 	case DMA_FROM_DEVICE:
-		ret = pci_epf_nvme_dma(epf_nvme, dma_phys_addr, map->phys_addr,
-				       map->size, map->pci_addr,
-				       DMA_DEV_TO_MEM);
+		ret = pci_epf_nvme_do_dma(epf_nvme, dma, dma_phys_addr,
+					  map->phys_addr, map->size,
+					  map->pci_addr, DMA_DEV_TO_MEM);
 		break;
 	case DMA_TO_DEVICE:
-		ret = pci_epf_nvme_dma(epf_nvme, map->phys_addr, dma_phys_addr,
-				       map->size, map->pci_addr,
-				       DMA_MEM_TO_DEV);
+		ret = pci_epf_nvme_do_dma(epf_nvme, dma, map->phys_addr,
+					  dma_phys_addr, map->size,
+					  map->pci_addr, DMA_MEM_TO_DEV);
 		break;
 	default:
 		ret = -EINVAL;
 	}
 
-	dma_unmap_single(epf_nvme->dma_dev, dma_phys_addr, map->size, dir);
+	dma_unmap_single(dma->dma_dev, dma_phys_addr, map->size, dir);
 
 	return ret;
 }
@@ -530,8 +545,10 @@ static int pci_epf_nvme_transfer(struct pci_epf_nvme *epf_nvme,
 			ret = pci_epf_nvme_mmio_transfer(epf_nvme, &map,
 							 buf, dir);
 		else
-			ret = pci_epf_nvme_dma_transfer(epf_nvme, &map,
-							buf, dir);
+			/* XXX TODO use particular DMA */
+			ret = pci_epf_nvme_dma_transfer(epf_nvme,
+							&epf_nvme->dmas[0],
+							&map, buf, dir);
 
 		pci_epf_mem_unmap(epf, &map);
 
@@ -2484,8 +2501,9 @@ static int pci_epf_nvme_bind(struct pci_epf *epf)
 	}
 
 	if (epf_nvme->dma_enable) {
-		epf_nvme->dma_supported = pci_epf_nvme_init_dma(epf_nvme);
-		if (epf_nvme->dma_supported) {
+		epf_nvme->dmas[0].dma_supported =
+			pci_epf_nvme_init_dma(epf_nvme, &epf_nvme->dmas[0]);
+		if (epf_nvme->dmas[0].dma_supported) {
 			dev_info(&epf->dev, "DMA supported\n");
 		} else {
 			dev_info(&epf->dev,
@@ -2512,7 +2530,7 @@ static void pci_epf_nvme_unbind(struct pci_epf *epf)
 
 	pci_epf_nvme_disable_ctrl(epf_nvme, true);
 
-	pci_epf_nvme_clean_dma(epf_nvme);
+	pci_epf_nvme_clean_dma(epf_nvme, &epf_nvme->dmas[0]);
 
 	for (bar = BAR_0; bar < PCI_STD_NUM_BARS; bar++) {
 		if (!epf_nvme->reg[bar])
