@@ -29,15 +29,9 @@
 #include "../../../nvme/target/nvmet.h"
 
 /*
- * To test the no wait version for submitting commands
+ * To enable threads (version without doesn't work as is)
  */
-#define PCI_EPF_NVME_TEST_CMD_NOWAIT 0
 #define PCI_EPF_NVME_THREADS 1
-
-/*
- * Maximum number of DMAs
- */
-#define PCI_EPF_NVME_MAX_DMA 1
 
 /*
  * Time to (busy) wait in microseconds if the completion queue is full
@@ -66,8 +60,9 @@ static struct workqueue_struct *epf_nvme_sq_wq;
 static struct kmem_cache *epf_nvme_cmd_cache;
 #if PCI_EPF_NVME_THREADS
 struct task_struct	*xfer_thread;
+int num_xfer_threads = 2;
 DECLARE_WAIT_QUEUE_HEAD(xfer_wq);
-struct task_struct	*cq_thread;
+struct task_struct	*cq_thread = NULL;
 DECLARE_WAIT_QUEUE_HEAD(cq_wq);
 #endif
 
@@ -143,11 +138,38 @@ struct pci_epf_nvme_ctrl {
 #define PCI_EPF_NVME_CMD_ASYNC		(1LU << 0)
 
 /*
+ * DMA fields
+ */
+struct pci_epf_nvme_dma {
+	bool				dma_supported;
+	bool				dma_private;
+	struct dma_chan			*dma_chan_tx;
+	struct dma_chan			*dma_chan_rx;
+	struct dma_chan			*dma_chan;
+	struct device			*dma_dev;
+	dma_cookie_t			dma_cookie;
+	enum dma_status			dma_status;
+	struct completion		dma_complete;
+};
+
+/*
+ * Transfer thread structure, can have a DMA
+ */
+struct pci_epf_nvme_xfer_thread {
+	struct pci_epf_nvme		*epf_nvme;
+	struct task_struct		*thread;
+	struct pci_epf_nvme_dma		dma;
+	int				tid;
+	__le64				*prp_list_buf;
+};
+
+/*
  * Descriptor for commands sent by the host. This is also used internally for
  * fabrics commands to control our fabrics target.
  */
 struct pci_epf_nvme_cmd {
 	struct pci_epf_nvme		*epf_nvme;
+	struct pci_epf_nvme_xfer_thread *xfer_thread;
 	unsigned long			flags;
 
 	struct nvme_ns			*ns;
@@ -176,20 +198,6 @@ struct pci_epf_nvme_cmd {
 	struct pci_epf_nvme_segment	seg;
 	struct pci_epf_nvme_segment	*segs;
 };
-/*
- * DMA fields
- */
-struct pci_epf_nvme_dma {
-	bool				dma_supported;
-	bool				dma_private;
-	struct dma_chan			*dma_chan_tx;
-	struct dma_chan			*dma_chan_rx;
-	struct dma_chan			*dma_chan;
-	struct device			*dma_dev;
-	dma_cookie_t			dma_cookie;
-	enum dma_status			dma_status;
-	struct completion		dma_complete;
-};
 
 /*
  * EPF function private data representing our NVMe subsystem.
@@ -205,17 +213,15 @@ struct pci_epf_nvme {
 	unsigned int			irq_type;
 	unsigned int			nr_vectors;
 
-	__le64				*prp_list_buf;
-
-	struct pci_epf_nvme_dma		dmas[PCI_EPF_NVME_MAX_DMA];
-
 	struct delayed_work		reg_poll;
 	struct delayed_work		sq_poll;
 	struct delayed_work		xfer_work;
-	spinlock_t			xfer_fifo_lock;
+	struct pci_epf_nvme_xfer_thread *xfer_threads;
+	spinlock_t			xfer_fifo_wr_lock;
+	spinlock_t			xfer_fifo_rd_lock;
 	DECLARE_KFIFO_PTR(xfer_fifo, typeof(struct pci_epf_nvme_cmd *));
 	struct delayed_work		completion_work;
-	spinlock_t			completion_fifo_lock;
+	spinlock_t			completion_fifo_wr_lock;
 	DECLARE_KFIFO_PTR(completion_fifo, typeof(struct pci_epf_nvme_cmd *));
 
 	atomic_t			in_flight_commands;
@@ -520,11 +526,12 @@ static int pci_epf_nvme_mmio_transfer(struct pci_epf_nvme *nvme,
 	}
 }
 
-static int pci_epf_nvme_transfer(struct pci_epf_nvme *epf_nvme,
+static int pci_epf_nvme_transfer(struct pci_epf_nvme_xfer_thread *xfer_thread,
 				 struct pci_epf_nvme_segment *seg,
 				 enum dma_data_direction dir, void *buf,
 				 bool no_dma)
 {
+	struct pci_epf_nvme *epf_nvme = xfer_thread->epf_nvme;
 	struct pci_epf_nvme_ctrl *ctrl = &epf_nvme->ctrl;
 	struct pci_epf *epf = epf_nvme->epf;
 	phys_addr_t addr = seg->pci_addr;
@@ -541,13 +548,13 @@ static int pci_epf_nvme_transfer(struct pci_epf_nvme *epf_nvme,
 			return map_size;
 
 		/* Do not bother with DMA for small transfers */
-		if (no_dma || !epf_nvme->dma_enable || map.size < ctrl->mps)
+		if (no_dma || !xfer_thread->dma.dma_supported ||
+		    map.size < ctrl->mps)
 			ret = pci_epf_nvme_mmio_transfer(epf_nvme, &map,
 							 buf, dir);
 		else
-			/* XXX TODO use particular DMA */
 			ret = pci_epf_nvme_dma_transfer(epf_nvme,
-							&epf_nvme->dmas[0],
+							&xfer_thread->dma,
 							&map, buf, dir);
 
 		pci_epf_mem_unmap(epf, &map);
@@ -644,18 +651,26 @@ static const char *pci_epf_nvme_cmd_name(struct pci_epf_nvme_cmd *epcmd)
 	return nvme_get_admin_opcode_str(opcode);
 }
 
-static int pci_epf_nvme_cmd_transfer(struct pci_epf_nvme *epf_nvme,
-				     struct pci_epf_nvme_cmd *epcmd,
-				     enum dma_data_direction dir)
+static int pci_epf_nvme_cmd_transfer(struct pci_epf_nvme_cmd *epcmd)
 {
+	struct pci_epf_nvme_xfer_thread *xfer_thread = epcmd->xfer_thread;
+	struct pci_epf_nvme *epf_nvme = xfer_thread->epf_nvme;
 	struct pci_epf_nvme_segment *seg;
 	void *buf = epcmd->buffer;
+	enum dma_data_direction dir = epcmd->dir;
 	size_t size = 0;
 	int i, ret;
 
 	/* Do nothing for commands already marked as failed */
 	if (epcmd->status != NVME_SC_SUCCESS)
 		return -EIO;
+
+	/* If the transfer length or direction is not defined */
+	if (!epcmd->transfer_len || dir == DMA_NONE ||
+	    dir == DMA_BIDIRECTIONAL) {
+		epcmd->status = NVME_SC_INTERNAL | NVME_SC_DNR;
+		return -EIO;
+	}
 
 	/* Go through the command segments and transfer each one */
 	for (i = 0; i < epcmd->nr_segs; i++) {
@@ -666,7 +681,7 @@ static int pci_epf_nvme_cmd_transfer(struct pci_epf_nvme *epf_nvme,
 			goto xfer_err;
 		}
 
-		ret = pci_epf_nvme_transfer(epf_nvme, seg, dir, buf, false);
+		ret = pci_epf_nvme_transfer(xfer_thread, seg, dir, buf, false);
 		if (ret)
 			goto xfer_err;
 
@@ -685,14 +700,14 @@ static inline void pci_epf_nvme_queue_response(struct pci_epf_nvme_cmd *epcmd);
 static inline void pci_epf_nvme_dispatch_cmd(struct pci_epf_nvme_cmd *epcmd);
 static inline void pci_epf_nvme_dispatch_cmd_xfer_first(
 	struct pci_epf_nvme_cmd *epcmd);
-static int pci_epf_nvme_cmd_parse_dptr(struct pci_epf_nvme *epf_nvme,
-				       struct pci_epf_nvme_cmd *epcmd);
+static int pci_epf_nvme_cmd_parse_dptr(struct pci_epf_nvme_cmd *epcmd);
 
 #if PCI_EPF_NVME_THREADS
 static int pci_epf_nvme_xfer_wq_fn(void *arg)
 {
 	int ret;
-	struct pci_epf_nvme *epf_nvme = (struct pci_epf_nvme *)arg;
+	struct pci_epf_nvme_xfer_thread *xfer_thread = arg;
+	struct pci_epf_nvme *epf_nvme = xfer_thread->epf_nvme;
 #else
 static void pci_epf_nvme_xfer_wq_fn(struct work_struct *work)
 {
@@ -704,35 +719,46 @@ static void pci_epf_nvme_xfer_wq_fn(struct work_struct *work)
 
 #if PCI_EPF_NVME_THREADS
 	while(1) {
-		wait_event_interruptible(xfer_wq, !kfifo_is_empty(&epf_nvme->xfer_fifo) ||
-					 epf_nvme->disabled);
-		if (epf_nvme->disabled)
+		spin_lock(&epf_nvme->xfer_fifo_rd_lock);
+		while (kfifo_is_empty(&epf_nvme->xfer_fifo) &&
+		       !epf_nvme->disabled) {
+			spin_unlock(&epf_nvme->xfer_fifo_rd_lock);
+			wait_event_interruptible(xfer_wq,
+				!kfifo_is_empty(&epf_nvme->xfer_fifo) ||
+				epf_nvme->disabled);
+			spin_lock(&epf_nvme->xfer_fifo_rd_lock);
+		}
+
+		if (epf_nvme->disabled) {
+			spin_unlock(&epf_nvme->xfer_fifo_rd_lock);
 			return 0;
+		}
+
+		ret = kfifo_get(&epf_nvme->xfer_fifo, &epcmd);
+		spin_unlock(&epf_nvme->xfer_fifo_rd_lock);
 #else
 	/* Note this could be implemented with wait_event_interruptible */
 	while (!kfifo_is_empty(&epf_nvme->xfer_fifo)) {
-#endif
 		ret = kfifo_get(&epf_nvme->xfer_fifo, &epcmd);
+#endif
 		if (ret != 1) {
 			dev_err(&epf_nvme->epf->dev,
 			        "Could not get element from completion FIFO\n");
-		}
-
-		if (!epcmd->transfer_len || epcmd->dir == DMA_NONE ||
-		    epcmd->dir == DMA_BIDIRECTIONAL) {
-			epcmd->status = NVME_SC_INTERNAL | NVME_SC_DNR;
-			pci_epf_nvme_queue_response(epcmd);
 			continue;
 		}
 
+#if PCI_EPF_NVME_THREADS
+		epcmd->xfer_thread = xfer_thread;
+#endif
+
 		/* Get the host buffer segments */
-		ret = pci_epf_nvme_cmd_parse_dptr(epf_nvme, epcmd);
+		ret = pci_epf_nvme_cmd_parse_dptr(epcmd);
 		if (ret) {
 			pci_epf_nvme_queue_response(epcmd);
 			continue;
 		}
 
-		ret = pci_epf_nvme_cmd_transfer(epf_nvme, epcmd, epcmd->dir);
+		ret = pci_epf_nvme_cmd_transfer(epcmd);
 		if (ret) {
 			pci_epf_nvme_queue_response(epcmd);
 			continue;
@@ -896,7 +922,7 @@ static inline void pci_epf_nvme_queue_response(struct pci_epf_nvme_cmd *epcmd)
 
 	/* Lock because this is called from multiple threads */
 	kfifo_in_spinlocked(&epcmd->epf_nvme->completion_fifo, &epcmd, 1,
-			    &epcmd->epf_nvme->completion_fifo_lock);
+			    &epcmd->epf_nvme->completion_fifo_wr_lock);
 #if PCI_EPF_NVME_THREADS
 	wake_up(&cq_wq);
 #endif
@@ -908,7 +934,7 @@ static inline int pci_epf_nvme_fetch_sqes(struct pci_epf_nvme *epf_nvme, int qid
 	struct pci_epf_nvme_queue *sq = &ctrl->sq[qid];
 	int num_cmds;
 
-	if (!sq->size)
+	if (!sq->size || !pci_epf_nvme_ctrl_ready(ctrl))
 		return 0;
 
 	sq->tail = pci_epf_nvme_reg_read32(ctrl, sq->db);
@@ -981,10 +1007,12 @@ pci_epf_nvme_fetch_cmd(struct pci_epf_nvme *epf_nvme, int qid)
 /*
  * Transfer a prp list from the host and return the number of prps.
  */
-static int pci_epf_nvme_get_prp_list(struct pci_epf_nvme *epf_nvme, u64 prp,
+static int pci_epf_nvme_get_prp_list(struct pci_epf_nvme_cmd *epcmd, u64 prp,
 				     size_t xfer_len)
 {
+	struct pci_epf_nvme *epf_nvme = epcmd->epf_nvme;
 	struct pci_epf_nvme_ctrl *ctrl = &epf_nvme->ctrl;
+	struct pci_epf_nvme_xfer_thread *xfer_thread = epcmd->xfer_thread;
 	size_t nr_prps = (xfer_len + ctrl->mps_mask) >> ctrl->mps_shift;
 	struct pci_epf_nvme_segment seg;
 	int ret;
@@ -998,20 +1026,20 @@ static int pci_epf_nvme_get_prp_list(struct pci_epf_nvme *epf_nvme, u64 prp,
 	 */
 	seg.pci_addr = prp;
 	seg.size = min(pci_epf_nvme_prp_size(ctrl, prp), nr_prps << 3);
-	ret = pci_epf_nvme_transfer(epf_nvme, &seg, DMA_FROM_DEVICE,
-				    epf_nvme->prp_list_buf, false /* no_dma */);
+	ret = pci_epf_nvme_transfer(xfer_thread, &seg, DMA_FROM_DEVICE,
+				    xfer_thread->prp_list_buf, false /* no_dma */);
 	if (ret)
 		return ret;
 
 	return seg.size >> 3;
 }
 
-static int pci_epf_nvme_cmd_parse_prp_list(struct pci_epf_nvme *epf_nvme,
-					   struct pci_epf_nvme_cmd *epcmd)
+static int pci_epf_nvme_cmd_parse_prp_list(struct pci_epf_nvme_cmd *epcmd)
 {
+	struct pci_epf_nvme *epf_nvme = epcmd->epf_nvme;
 	struct pci_epf_nvme_ctrl *ctrl = &epf_nvme->ctrl;
 	struct nvme_command *cmd = epcmd->cmd;
-	__le64 *prps = epf_nvme->prp_list_buf;
+	__le64 *prps = epcmd->xfer_thread->prp_list_buf;
 	struct pci_epf_nvme_segment *seg;
 	size_t size = 0, ofst, prp_size, xfer_len;
 	int nr_segs, nr_prps = 0;
@@ -1059,7 +1087,7 @@ static int pci_epf_nvme_cmd_parse_prp_list(struct pci_epf_nvme *epf_nvme,
 
 		if (!nr_prps) {
 			/* Get the prp list */
-			nr_prps = pci_epf_nvme_get_prp_list(epf_nvme, prp,
+			nr_prps = pci_epf_nvme_get_prp_list(epcmd, prp,
 							    xfer_len);
 			if (nr_prps < 0)
 				goto internal;
@@ -1129,9 +1157,9 @@ invalid_field:
 	return -EINVAL;
 }
 
-static int pci_epf_nvme_cmd_parse_prp_simple(struct pci_epf_nvme *epf_nvme,
-					     struct pci_epf_nvme_cmd *epcmd)
+static int pci_epf_nvme_cmd_parse_prp_simple(struct pci_epf_nvme_cmd *epcmd)
 {
+	struct pci_epf_nvme *epf_nvme = epcmd->epf_nvme;
 	struct pci_epf_nvme_ctrl *ctrl = &epf_nvme->ctrl;
 	struct nvme_command *cmd = epcmd->cmd;
 	int ret, nr_segs = 1;
@@ -1182,9 +1210,9 @@ internal:
 	return ret;
 }
 
-static int pci_epf_nvme_cmd_parse_dptr(struct pci_epf_nvme *epf_nvme,
-				       struct pci_epf_nvme_cmd *epcmd)
+static int pci_epf_nvme_cmd_parse_dptr(struct pci_epf_nvme_cmd *epcmd)
 {
+	struct pci_epf_nvme *epf_nvme = epcmd->epf_nvme;
 	struct pci_epf_nvme_ctrl *ctrl = &epf_nvme->ctrl;
 	struct nvme_command *cmd = epcmd->cmd;
 	u64 prp1 = le64_to_cpu(cmd->common.dptr.prp1);
@@ -1204,9 +1232,9 @@ static int pci_epf_nvme_cmd_parse_dptr(struct pci_epf_nvme *epf_nvme,
 		goto invalid_offset;
 
 	if (epcmd->transfer_len + ofst <= NVME_CTRL_PAGE_SIZE * 2)
-		ret = pci_epf_nvme_cmd_parse_prp_simple(epf_nvme, epcmd);
+		ret = pci_epf_nvme_cmd_parse_prp_simple(epcmd);
 	else
-		ret = pci_epf_nvme_cmd_parse_prp_list(epf_nvme, epcmd);
+		ret = pci_epf_nvme_cmd_parse_prp_list(epcmd);
 	if (ret)
 		return ret;
 
@@ -1526,13 +1554,83 @@ out_delete_ctrl:
 	return ret;
 }
 
+static void pci_epf_nvme_alloc_dma(struct pci_epf_nvme_xfer_thread *xfer_thread)
+{
+	struct pci_epf_nvme *epf_nvme = xfer_thread->epf_nvme;
+	struct pci_epf *epf = epf_nvme->epf;
+
+	if (epf_nvme->dma_enable) {
+		xfer_thread->dma.dma_supported =
+			pci_epf_nvme_init_dma(epf_nvme, &xfer_thread->dma);
+		if (xfer_thread->dma.dma_supported) {
+			dev_info(&epf->dev,
+				 "Transfer thread %d: DMA supported\n",
+				 xfer_thread->tid);
+		} else {
+			dev_info(&epf->dev,
+				 "Transfer thread %d: DMA not supported,"
+				 "falling back to mmio\n",
+				 xfer_thread->tid);
+		}
+	} else {
+		xfer_thread->dma.dma_supported = false;
+		dev_info(&epf->dev, "Transfer thread %d: DMA disabled\n",
+			 xfer_thread->tid);
+	}
+}
+
+static inline void
+pci_epf_nvme_free_dma(struct pci_epf_nvme_xfer_thread *xfer_thread)
+{
+	pci_epf_nvme_clean_dma(xfer_thread->epf_nvme, &xfer_thread->dma);
+}
+
+static int pci_epf_nvme_alloc_thread(struct pci_epf_nvme *epf_nvme, int tid)
+{
+	struct pci_epf_nvme_xfer_thread *thread = &epf_nvme->xfer_threads[tid];
+	thread->epf_nvme = epf_nvme;
+	thread->tid = tid;
+	thread->prp_list_buf = kzalloc(NVME_CTRL_PAGE_SIZE, GFP_KERNEL);
+	if (!thread->prp_list_buf) {
+		return -ENOMEM;
+	}
+
+	pci_epf_nvme_alloc_dma(thread);
+
+	thread->thread = kthread_run(pci_epf_nvme_xfer_wq_fn,
+				     (void *)thread,
+				     "xfer_thread %d", tid);
+	if (IS_ERR_OR_NULL(thread->thread)) {
+		dev_err(&epf_nvme->epf->dev,
+			"Error creating xfer thread %d\n", tid);
+		thread->tid = 0;
+		pci_epf_nvme_free_dma(thread);
+		kfree(thread->prp_list_buf);
+		thread->prp_list_buf = NULL;
+		return -ENOMEM;
+	}
+
+	return 0;
+}
+
+static void pci_epf_nvme_free_thread(struct pci_epf_nvme_xfer_thread *thread)
+{
+	if (thread) {
+		kthread_stop(thread->thread);
+		thread->thread = NULL;
+		pci_epf_nvme_free_dma(thread);
+		kfree(thread->prp_list_buf);
+		thread->prp_list_buf = NULL;
+	}
+}
+
 static void pci_epf_nvme_disable_ctrl(struct pci_epf_nvme *epf_nvme,
 				      bool shutdown)
 {
 	struct pci_epf_nvme_ctrl *ctrl = &epf_nvme->ctrl;
 	struct pci_epf *epf = epf_nvme->epf;
-	int qid;
-	int val;
+	int qid, val, temp = 0;
+	bool empty = false;
 
 	dev_info(&epf->dev, "%s controller\n",
 		 shutdown ? "Shutting down" : "Disabling");
@@ -1540,21 +1638,50 @@ static void pci_epf_nvme_disable_ctrl(struct pci_epf_nvme *epf_nvme,
 	/* Stop polling the submission queues */
 	cancel_delayed_work_sync(&epf_nvme->sq_poll);
 
-	for (qid = ctrl->nr_queues - 1; qid >= 0; qid--)
-		pci_epf_nvme_drain_sq(epf_nvme, qid);
+	/* XXX We don't have to execute more commands if disabled !
+	   don't transfer SQEs from host ! see NVMe specifications XXX */
+	//for (qid = ctrl->nr_queues - 1; qid >= 0; qid--)
+	//	pci_epf_nvme_drain_sq(epf_nvme, qid);
 
 	/* Wait for all in-flight commands to finish */
-	while((val = atomic_read(&epf_nvme->in_flight_commands)))
+	val = atomic_read(&epf_nvme->in_flight_commands);
+	dev_info(&epf->dev, "There are %d commands in flight\n", val);
+	while((val = atomic_read(&epf_nvme->in_flight_commands))) {
+		if (++temp == 100) {
+			dev_info(&epf->dev,
+				 "Waiting for %d commands to be flushed\n", val);
+			empty = kfifo_is_empty(&epf_nvme->xfer_fifo);
+			dev_info(&epf->dev,
+				 "xfer fifo is %s\n",
+				 (empty ?
+				 "empty" : "not empty"));
+			empty = kfifo_is_empty(&epf_nvme->completion_fifo);
+			dev_info(&epf->dev,
+				 "completion fifo is %s\n",
+				 (empty ?
+				 "empty" : "not empty"));
+			temp = 0;
+		}
 		msleep(1);
+	}
 
 	/* Tell all the work that the controller is disabled*/
-	epf_nvme->disabled = true;
+	WRITE_ONCE(epf_nvme->disabled, true);
 #if PCI_EPF_NVME_THREADS
-	wake_up(&xfer_wq);
+	if (epf_nvme->xfer_threads) {
+		wake_up_all(&xfer_wq);
+		for (int i = 0; i < num_xfer_threads; ++i) {
+			pci_epf_nvme_free_thread(&epf_nvme->xfer_threads[i]);
+		}
+		kfree(epf_nvme->xfer_threads);
+		dev_info(&epf->dev, "Transfer threads joined\n");
+	}
 	wake_up(&cq_wq);
-	kthread_stop(xfer_thread);
-	kthread_stop(cq_thread);
-	dev_info(&epf->dev, "Threads joined\n");
+	if (cq_thread) {
+		kthread_stop(cq_thread);
+		cq_thread = NULL;
+	}
+	dev_info(&epf->dev, "All threads joined\n");
 #else
 	cancel_delayed_work_sync(&epf_nvme->xfer_work);
 	cancel_delayed_work_sync(&epf_nvme->completion_work);
@@ -1636,30 +1763,41 @@ static void pci_epf_nvme_enable_ctrl(struct pci_epf_nvme *epf_nvme)
 		return;
 	}
 
+	/* Controller is no longer disabled */
+	epf_nvme->disabled = false;
+
 	/* Tell the host we are now ready */
 	ctrl->csts |= NVME_CSTS_RDY;
 	pci_epf_nvme_reg_write32(ctrl, NVME_REG_CSTS, ctrl->csts);
-
-	/* Controller is no longer disabled */
-	epf_nvme->disabled = false;
 
 	/* Start polling the submission queues */
 	queue_delayed_work(epf_nvme_sq_wq, &epf_nvme->sq_poll,
 			   msecs_to_jiffies(1));
 #if PCI_EPF_NVME_THREADS
-	xfer_thread = kthread_run(pci_epf_nvme_xfer_wq_fn,
-				  (void *)epf_nvme,
-				  "xfer_thread");
-	if (IS_ERR_OR_NULL(xfer_thread)) {
-		dev_err(&epf_nvme->epf->dev, "Error creating xfer thread");
-		return;
+	epf_nvme->xfer_threads = kzalloc(num_xfer_threads *
+					sizeof(struct pci_epf_nvme_xfer_thread),
+					GFP_KERNEL);
+	if (IS_ERR_OR_NULL(epf_nvme->xfer_threads)) {
+		dev_err(&epf_nvme->epf->dev, "Error creating xfer threads");
+		goto disable;
+	}
+	for (int i = 0; i < num_xfer_threads; ++i) {
+		ret = pci_epf_nvme_alloc_thread(epf_nvme, i);
+		if (ret < 0) {
+			dev_err(&epf_nvme->epf->dev,
+				"Error creating xfer thread %d\n", i);
+			if (i < 1)
+				goto disable;
+			else /* We have at least one thread, that's enough */
+				break;
+		}
 	}
 	cq_thread = kthread_run(pci_epf_nvme_completion_wq_fn,
 				(void *)epf_nvme,
 				"completion_thread");
 	if (IS_ERR_OR_NULL(cq_thread)) {
 		dev_err(&epf_nvme->epf->dev, "Error creating completion thread");
-		return;
+		goto disable;
 	}
 #else
 	/* Start work for transfers */
@@ -1671,6 +1809,8 @@ static void pci_epf_nvme_enable_ctrl(struct pci_epf_nvme *epf_nvme)
 #endif
 
 	return;
+disable:
+	pci_epf_nvme_disable_ctrl(epf_nvme, false);
 }
 
 static enum rq_end_io_ret pci_epf_nvme_backend_cmd_done_cb(struct request *req,
@@ -1784,7 +1924,7 @@ static inline void pci_epf_nvme_dispatch_cmd_xfer_first(
 
 	/* Lock because this is called from multiple threads */
 	kfifo_in_spinlocked(&epcmd->epf_nvme->xfer_fifo, &epcmd, 1,
-			    &epcmd->epf_nvme->xfer_fifo_lock);
+			    &epcmd->epf_nvme->xfer_fifo_wr_lock);
 #if PCI_EPF_NVME_THREADS
 	wake_up(&xfer_wq);
 #endif
@@ -1933,6 +2073,14 @@ static void pci_epf_nvme_process_admin_cmd(struct pci_epf_nvme_cmd *epcmd)
 	case nvme_admin_async_event:
 		/* XXX For now XXX */
 		dev_info(&epf_nvme->epf->dev, "nvme_admin_async_event\n");
+		/* The controller posts a completion queue entry for this
+		 * command when there is an asynchronous event to report to the
+		 * host. If Asynchronous Event Request commands are outstanding
+		 * when the controller is reset, then each of those commands is
+		 * aborted and should not return a CQE */
+
+		/* XXX For the moment just ignore and free the command XXX */
+		pci_epf_nvme_free_cmd(epcmd);
 		return;
 
 	case nvme_admin_get_features:
@@ -2135,7 +2283,7 @@ static void pci_epf_nvme_reg_poll(struct work_struct *work)
 	if (!(old_cc & NVME_CC_ENABLE) && !(ctrl->cc & NVME_CC_ENABLE))
 		goto again;
 
-	/* If CC.EN was set by the host, enbale the controller */
+	/* If CC.EN was set by the host, enable the controller */
 	if (!(old_cc & NVME_CC_ENABLE) && (ctrl->cc & NVME_CC_ENABLE)) {
 		pci_epf_nvme_enable_ctrl(epf_nvme);
 		goto again;
@@ -2500,19 +2648,8 @@ static int pci_epf_nvme_bind(struct pci_epf *epf)
 			return ret;
 	}
 
-	if (epf_nvme->dma_enable) {
-		epf_nvme->dmas[0].dma_supported =
-			pci_epf_nvme_init_dma(epf_nvme, &epf_nvme->dmas[0]);
-		if (epf_nvme->dmas[0].dma_supported) {
-			dev_info(&epf->dev, "DMA supported\n");
-		} else {
-			dev_info(&epf->dev,
-				 "DMA not supported, falling back to mmio\n");
-			epf_nvme->dma_enable = false;
-		}
-	} else {
-		dev_info(&epf->dev, "DMA disabled\n");
-	}
+	dev_info(&epf->dev, "DMAs %sabled\n",
+		 (epf_nvme->dma_enable ? "en" : "dis"));
 
 	if (!epc_features->linkup_notifier && !epc_features->core_init_notifier)
 		queue_delayed_work(epf_nvme_reg_wq, &epf_nvme->reg_poll,
@@ -2529,8 +2666,6 @@ static void pci_epf_nvme_unbind(struct pci_epf *epf)
 	cancel_delayed_work(&epf_nvme->reg_poll);
 
 	pci_epf_nvme_disable_ctrl(epf_nvme, true);
-
-	pci_epf_nvme_clean_dma(epf_nvme, &epf_nvme->dmas[0]);
 
 	for (bar = BAR_0; bar < PCI_STD_NUM_BARS; bar++) {
 		if (!epf_nvme->reg[bar])
@@ -2573,11 +2708,6 @@ static int pci_epf_nvme_probe(struct pci_epf *epf,
 	dev_info(&epf_nvme->epf->dev, "Version with workqueues and bulk SQEs\n");
 #endif
 
-	epf_nvme->prp_list_buf = devm_kzalloc(&epf->dev, NVME_CTRL_PAGE_SIZE,
-					      GFP_KERNEL);
-	if (!epf_nvme->prp_list_buf)
-		return -ENOMEM; /* XXX epf_nvme should be freed XXX */
-
 	/* Set default attribute values */
 	epf_nvme->dma_enable = true;
 
@@ -2585,13 +2715,14 @@ static int pci_epf_nvme_probe(struct pci_epf *epf,
 	epf->header = &epf_nvme_pci_header;
 	epf_set_drvdata(epf, epf_nvme);
 
-	spin_lock_init(&epf_nvme->xfer_fifo_lock);
+	spin_lock_init(&epf_nvme->xfer_fifo_wr_lock);
+	spin_lock_init(&epf_nvme->xfer_fifo_rd_lock);
 	ret = kfifo_alloc(&epf_nvme->xfer_fifo, PCI_EPF_NVME_FIFO_SIZE,
 			  GFP_KERNEL);
 	if (ret)
 		return ret; /* XXX memory should be freed XXX */
 
-	spin_lock_init(&epf_nvme->completion_fifo_lock);
+	spin_lock_init(&epf_nvme->completion_fifo_wr_lock);
 	ret = kfifo_alloc(&epf_nvme->completion_fifo, PCI_EPF_NVME_FIFO_SIZE,
 		GFP_KERNEL);
 	if (ret)
