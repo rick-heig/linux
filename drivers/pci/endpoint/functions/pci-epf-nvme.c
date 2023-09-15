@@ -2248,7 +2248,7 @@ static void pci_epf_nvme_sq_poll(struct work_struct *work)
 		container_of(work, struct pci_epf_nvme, sq_poll.work);
 	struct pci_epf_nvme_ctrl *ctrl = &epf_nvme->ctrl;
 	bool work_to_do = true;
-	int qid;
+	int qid, val;
 
 	/* Process pending commands, starting with the IO queues */
 	while (work_to_do && pci_epf_nvme_ctrl_ready(ctrl)) {
@@ -2260,7 +2260,13 @@ static void pci_epf_nvme_sq_poll(struct work_struct *work)
 	if (!pci_epf_nvme_ctrl_ready(ctrl))
 		return;
 
-	queue_delayed_work(epf_nvme_sq_wq, &epf_nvme->sq_poll, 1);
+	val = atomic_read(&epf_nvme->in_flight_commands);
+	if (val > 10)
+		/* Relaxed polling, we have enough work for a while */
+		queue_delayed_work(epf_nvme_sq_wq, &epf_nvme->sq_poll,
+				   msecs_to_jiffies(2));
+	else
+		queue_delayed_work(epf_nvme_sq_wq, &epf_nvme->sq_poll, 1);
 }
 
 static void pci_epf_nvme_reg_poll(struct work_struct *work)
