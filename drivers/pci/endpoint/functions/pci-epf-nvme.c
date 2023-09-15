@@ -60,7 +60,7 @@ static struct workqueue_struct *epf_nvme_sq_wq;
 static struct kmem_cache *epf_nvme_cmd_cache;
 #if PCI_EPF_NVME_THREADS
 struct task_struct	*xfer_thread;
-int num_xfer_threads = 2;
+int num_xfer_threads = 3;
 DECLARE_WAIT_QUEUE_HEAD(xfer_wq);
 struct task_struct	*cq_thread = NULL;
 DECLARE_WAIT_QUEUE_HEAD(cq_wq);
@@ -93,7 +93,9 @@ struct pci_epf_nvme_queue {
 
 	size_t			qes;
 
+	phys_addr_t		pci_addr;
 	struct pci_epc_map	map;
+	bool			mapped;
 
 	struct nvme_command	*local_queue;
 	u16			local_tail;
@@ -928,11 +930,53 @@ static inline void pci_epf_nvme_queue_response(struct pci_epf_nvme_cmd *epcmd)
 #endif
 }
 
+static inline void pci_epf_nvme_unmap_sq(struct pci_epf_nvme *epf_nvme, int qid)
+{
+	struct pci_epf_nvme_queue *sq = &epf_nvme->ctrl.sq[qid];
+	if (sq->mapped) {
+		pci_epf_mem_unmap(epf_nvme->epf, &sq->map);
+		sq->mapped = false;
+	}
+}
+
+static int pci_epf_nvme_map_sq(struct pci_epf_nvme *epf_nvme, int qid)
+{
+	struct pci_epf *epf = epf_nvme->epf;
+	struct pci_epf_nvme_ctrl *ctrl = &epf_nvme->ctrl;
+	struct pci_epf_nvme_queue *sq = &ctrl->sq[qid];
+	size_t qsize = sq->qes * sq->depth;
+	int ret;
+
+	if (sq->mapped)
+		return 0;
+
+	ret = pci_epf_mem_map(epf, sq->pci_addr, qsize, &sq->map);
+	if (ret != qsize) {
+		if (ret > 0) {
+			dev_err(&epf->dev, "Partial SQ %d mapping\n", qid);
+			pci_epf_mem_unmap(epf, &sq->map);
+			ret = -ENOMEM;
+		} else {
+			dev_err(&epf->dev, "Map SQ %d failed\n", qid);
+		}
+		return ret;
+	}
+
+	sq->mapped = true;
+
+	dev_dbg(&epf->dev,
+		"SQ %d: PCI addr 0x%llx, virt addr 0x%llx, size %zu B\n",
+		qid, sq->map.pci_addr, (u64)sq->map.virt_addr, qsize);
+
+	return 0;
+}
+
 static inline int pci_epf_nvme_fetch_sqes(struct pci_epf_nvme *epf_nvme, int qid)
 {
 	struct pci_epf_nvme_ctrl *ctrl = &epf_nvme->ctrl;
 	struct pci_epf_nvme_queue *sq = &ctrl->sq[qid];
 	int num_cmds;
+	int ret;
 
 	if (!sq->size || !pci_epf_nvme_ctrl_ready(ctrl))
 		return 0;
@@ -940,6 +984,12 @@ static inline int pci_epf_nvme_fetch_sqes(struct pci_epf_nvme *epf_nvme, int qid
 	sq->tail = pci_epf_nvme_reg_read32(ctrl, sq->db);
 	if (sq->tail == sq->head) {
 		/* Queue empty */
+		return 0;
+	}
+
+	ret = pci_epf_nvme_map_sq(epf_nvme, qid);
+	if (ret) {
+		dev_err(&epf_nvme->epf->dev, "Cannot map SQ id: %d\n", qid);
 		return 0;
 	}
 
@@ -962,44 +1012,9 @@ static inline int pci_epf_nvme_fetch_sqes(struct pci_epf_nvme *epf_nvme, int qid
 		sq->local_tail = sq->tail;
 	}
 
+	pci_epf_nvme_unmap_sq(epf_nvme, qid);
+
 	return num_cmds;
-}
-
-static struct pci_epf_nvme_cmd *
-pci_epf_nvme_fetch_cmd(struct pci_epf_nvme *epf_nvme, int qid)
-{
-	struct pci_epf_nvme_ctrl *ctrl = &epf_nvme->ctrl;
-	struct pci_epf_nvme_queue *sq = &ctrl->sq[qid];
-	struct pci_epf_nvme_cmd *epcmd;
-
-	if (!sq->size)
-		return NULL;
-
-	sq->tail = pci_epf_nvme_reg_read32(ctrl, sq->db);
-	if (sq->tail == sq->head) {
-		/* Queue empty */
-		return NULL;
-	}
-
-	epcmd = pci_epf_nvme_alloc_cmd(epf_nvme);
-	if (!epcmd)
-		return NULL;
-
-	/* Get the NVMe command submitted by the host */
-	pci_epf_nvme_init_cmd(epf_nvme, epcmd, sq->qid, sq->cqid);
-	memcpy_fromio(&epcmd->cmd, sq->map.virt_addr + sq->head * sq->qes,
-		      sizeof(struct nvme_command));
-
-	dev_dbg(&epf_nvme->epf->dev,
-		"sq[%d]: head %d/%d, tail %d, command %s\n",
-		qid, (int)sq->head, (int)sq->depth, (int)sq->tail,
-		pci_epf_nvme_cmd_name(epcmd));
-
-	sq->head++;
-	if (sq->head == sq->depth)
-		sq->head = 0;
-
-	return epcmd;
 }
 
 /*
@@ -1319,7 +1334,7 @@ static int pci_epf_nvme_map_cq(struct pci_epf_nvme *epf_nvme, int qid,
 	return 0;
 }
 
-static void pci_epf_nvme_unmap_sq(struct pci_epf_nvme *epf_nvme, int qid)
+static void pci_epf_nvme_clean_sq(struct pci_epf_nvme *epf_nvme, int qid)
 {
 	struct pci_epf_nvme_queue *sq = &epf_nvme->ctrl.sq[qid];
 
@@ -1332,20 +1347,20 @@ static void pci_epf_nvme_unmap_sq(struct pci_epf_nvme *epf_nvme, int qid)
 	WARN_ON_ONCE(epf_nvme->ctrl.cq[sq->cqid].ref < 1);
 	epf_nvme->ctrl.cq[sq->cqid].ref--;
 
-	pci_epf_mem_unmap(epf_nvme->epf, &sq->map);
+	if (sq->mapped)
+		pci_epf_mem_unmap(epf_nvme->epf, &sq->map);
 	if (sq->local_queue)
 		kfree(sq->local_queue);
 	memset(sq, 0, sizeof(*sq));
 }
 
-static int pci_epf_nvme_map_sq(struct pci_epf_nvme *epf_nvme, int qid,
+static int pci_epf_nvme_init_sq(struct pci_epf_nvme *epf_nvme, int qid,
 			       int cqid, int flags, int size,
 			       phys_addr_t pci_addr)
 {
 	struct pci_epf_nvme_ctrl *ctrl = &epf_nvme->ctrl;
 	struct pci_epf_nvme_queue *sq = &ctrl->sq[qid];
 	struct pci_epf *epf = epf_nvme->epf;
-	size_t qsize;
 	ssize_t ret;
 
 	/* Setup and map the submission queue */
@@ -1362,20 +1377,16 @@ static int pci_epf_nvme_map_sq(struct pci_epf_nvme *epf_nvme, int qid,
 		sq->qes = ctrl->adm_sqes;
 	else
 		sq->qes = ctrl->io_sqes;
-	qsize = sq->qes * sq->depth;
 
-	ret = pci_epf_mem_map(epf, pci_addr, qsize, &sq->map);
-	if (ret != qsize) {
-		if (ret > 0) {
-			dev_err(&epf->dev, "Partial SQ %d mapping\n", qid);
-			pci_epf_mem_unmap(epf, &sq->map);
-			ret = -ENOMEM;
-		} else {
-			dev_err(&epf->dev, "Map SQ %d failed\n", qid);
-		}
+	sq->pci_addr = pci_addr;
+	sq->mapped = false;
+	/* Try to map, to detect unmappable (partially mappable) queues */
+	ret = pci_epf_nvme_map_sq(epf_nvme, qid);
+	if (ret) {
 		memset(sq, 0, sizeof(*sq));
 		return ret;
 	}
+	pci_epf_nvme_unmap_sq(epf_nvme, qid);
 
 	sq->local_queue = kmalloc(sq->depth * sizeof(struct nvme_command),
 				  GFP_KERNEL);
@@ -1383,7 +1394,7 @@ static int pci_epf_nvme_map_sq(struct pci_epf_nvme *epf_nvme, int qid,
 
 	if (!sq->local_queue) {
 		dev_err(&epf->dev, "Couldn't allocate space for local queue\n");
-		pci_epf_mem_unmap(epf, &sq->map);
+		memset(sq, 0, sizeof(*sq));
 		ret = -ENOMEM;
 	}
 
@@ -1391,27 +1402,10 @@ static int pci_epf_nvme_map_sq(struct pci_epf_nvme *epf_nvme, int qid,
 	epf_nvme->ctrl.cq[cqid].ref++;
 
 	dev_dbg(&epf->dev,
-		"SQ %d: PCI addr 0x%llx, virt addr 0x%llx, size %zu B\n",
-		qid, sq->map.pci_addr, (u64)sq->map.virt_addr, qsize);
-	dev_dbg(&epf->dev,
 		"SQ %d: %d queue entries of %zu B, CQ %d\n",
 		qid, size, sq->qes, cqid);
 
 	return 0;
-}
-
-static void pci_epf_nvme_drain_sq(struct pci_epf_nvme *epf_nvme, int qid)
-{
-	struct pci_epf_nvme_queue *sq = &epf_nvme->ctrl.sq[qid];
-	struct pci_epf_nvme_cmd *epcmd;
-
-	if (!sq->size)
-		return;
-
-	while((epcmd = pci_epf_nvme_fetch_cmd(epf_nvme, qid))) {
-		epcmd->status = NVME_SC_ABORT_QUEUE | NVME_SC_DNR;
-		pci_epf_nvme_queue_response(epcmd);
-	}
 }
 
 static void pci_epf_nvme_init_ctrl_regs(struct pci_epf_nvme *epf_nvme)
@@ -1687,7 +1681,7 @@ static void pci_epf_nvme_disable_ctrl(struct pci_epf_nvme *epf_nvme,
 	 * on the completion queues.
 	 */
 	for (qid = ctrl->nr_queues - 1; qid >= 0; qid--)
-		pci_epf_nvme_unmap_sq(epf_nvme, qid);
+		pci_epf_nvme_clean_sq(epf_nvme, qid);
 
 	for (qid = ctrl->nr_queues - 1; qid >= 0; qid--)
 		pci_epf_nvme_unmap_cq(epf_nvme, qid);
@@ -1750,9 +1744,9 @@ static void pci_epf_nvme_enable_ctrl(struct pci_epf_nvme *epf_nvme)
 	if (ret)
 		return;
 
-	ret = pci_epf_nvme_map_sq(epf_nvme, 0, 0, NVME_QUEUE_PHYS_CONTIG,
-				  ctrl->aqa & 0x0fff,
-				  ctrl->asq & GENMASK(63, 12));
+	ret = pci_epf_nvme_init_sq(epf_nvme, 0, 0, NVME_QUEUE_PHYS_CONTIG,
+				   ctrl->aqa & 0x0fff,
+				   ctrl->asq & GENMASK(63, 12));
 	if (ret) {
 		pci_epf_nvme_unmap_cq(epf_nvme, 0);
 		return;
@@ -2006,8 +2000,8 @@ static void pci_epf_nvme_admin_create_sq(struct pci_epf_nvme *epf_nvme,
 		return;
 	}
 
-	ret = pci_epf_nvme_map_sq(epf_nvme, sqid, cqid, sq_flags, qsize,
-				  le64_to_cpu(cmd->create_sq.prp1));
+	ret = pci_epf_nvme_init_sq(epf_nvme, sqid, cqid, sq_flags, qsize,
+				   le64_to_cpu(cmd->create_sq.prp1));
 	if (ret) {
 		dev_warn(&epf_nvme->epf->dev,
 			 "Cannot map SQ\n");
