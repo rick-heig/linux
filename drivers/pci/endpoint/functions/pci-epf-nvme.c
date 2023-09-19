@@ -53,7 +53,7 @@
 static struct workqueue_struct *epf_nvme_reg_wq;
 static struct workqueue_struct *epf_nvme_sq_wq;
 static struct kmem_cache *epf_nvme_cmd_cache;
-static int num_xfer_threads = 3;
+static int num_xfer_threads = 1;
 DECLARE_WAIT_QUEUE_HEAD(xfer_wq);
 DECLARE_WAIT_QUEUE_HEAD(cq_wq);
 
@@ -1653,7 +1653,7 @@ static void pci_epf_nvme_enable_ctrl(struct pci_epf_nvme *epf_nvme)
 {
 	struct pci_epf_nvme_ctrl *ctrl = &epf_nvme->ctrl;
 	struct pci_epf *epf = epf_nvme->epf;
-	int ret;
+	int ret, effective_xfer_threads;
 
 	dev_info(&epf->dev, "Enabling controller\n");
 
@@ -1721,6 +1721,20 @@ static void pci_epf_nvme_enable_ctrl(struct pci_epf_nvme *epf_nvme)
 		dev_err(&epf_nvme->epf->dev, "Error creating xfer threads");
 		goto disable;
 	}
+
+	effective_xfer_threads = min_t(int, num_xfer_threads,
+			epf->epc->num_windows - (epf_nvme->ctrl.nr_queues + 1));
+
+	if (effective_xfer_threads < 1) {
+		dev_err(&epf_nvme->epf->dev, "Cannot init transfer threads\n");
+		goto disable;
+	} else if (effective_xfer_threads != num_xfer_threads) {
+		dev_warn(&epf_nvme->epf->dev,
+			 "Can only accomodate %d transfer threads\n",
+			 effective_xfer_threads);
+		num_xfer_threads = effective_xfer_threads;
+	}
+
 	for (int i = 0; i < num_xfer_threads; ++i) {
 		ret = pci_epf_nvme_alloc_thread(epf_nvme, i);
 		if (ret < 0) {
@@ -2298,11 +2312,14 @@ static int pci_epf_nvme_alloc_reg_bar(struct pci_epf *epf)
 	 * pairs mapped. So we are also limited by the number of memory windows
 	 * we have. Set our maximum number of queues based on these limits.
 	 *
-	 * num_windows / 2 because SQ and CQ are mappend permanently
-	 * - 2 because 1 window is for the DMA 1 window is for process_xxx_sq
-	 * to map when getting the PRP list
+	 * CQs are permanently mapped, one window per CQ
+	 * SQs are mapped dynamically and one window is used by sq_poll
+	 * xfer threads use a window each, at least one is required
+	 *
+	 * Therefore max number of (CQ) queues is the number of windows minus
+	 * one for sq_poll dynamic SQ mapping and at least one for xfer thread
 	 */
-	epf_nvme->max_nr_queues = (epf->epc->num_windows - 2) / 2;
+	epf_nvme->max_nr_queues = (epf->epc->num_windows - 2);
 	if (features->msix_capable)
 		epf_nvme->max_nr_queues =
 			min_t(unsigned int, epf->msix_interrupts,
@@ -2744,9 +2761,35 @@ static ssize_t pci_epf_nvme_dma_enable_store(struct config_item *item,
 
 CONFIGFS_ATTR(pci_epf_nvme_, dma_enable);
 
+static ssize_t pci_epf_nvme_num_xfer_threads_show(struct config_item *item,
+						  char *page)
+{
+	return sysfs_emit(page, "%d\n", num_xfer_threads);
+}
+
+static ssize_t pci_epf_nvme_num_xfer_threads_store(struct config_item *item,
+						   const char *page, size_t len)
+{
+	int ret;
+
+	ret = kstrtoint(page, 10, &num_xfer_threads);
+	if (ret)
+		return ret;
+
+	if (num_xfer_threads < 1) {
+		num_xfer_threads = 1;
+		return -EINVAL;
+	}
+
+	return len;
+}
+
+CONFIGFS_ATTR(pci_epf_nvme_, num_xfer_threads);
+
 static struct configfs_attribute *pci_epf_nvme_attrs[] = {
 	&pci_epf_nvme_attr_ctrl_opts,
 	&pci_epf_nvme_attr_dma_enable,
+	&pci_epf_nvme_attr_num_xfer_threads,
 	NULL,
 };
 
