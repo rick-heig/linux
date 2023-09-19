@@ -113,7 +113,7 @@ static int xilinx_pcie_ep_get_fixed_bar(struct pci_epc *epc, u8 fn, u8 vfn,
 	switch (epf_bar->barno) {
 	case BAR_0:
 		/* This is fixed */ /** @todo get from DT */
-		epf_bar->phys_addr = 0x480000000ULL;
+		epf_bar->phys_addr = 0x470000000ULL;
 		break;
 	case BAR_1:
 		/* This is fixed */ /** @todo get from DT */
