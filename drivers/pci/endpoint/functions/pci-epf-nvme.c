@@ -22,6 +22,7 @@
 #include <linux/spinlock.h>
 #include <linux/atomic.h>
 #include <linux/kthread.h>
+#include <linux/cdev.h>
 #include <net/sock.h>
 #include <generated/utsrelease.h>
 
@@ -438,12 +439,28 @@ static CsCapabilities tsp_cs_caps = {
 
 static const char *TSP_CS_ID_STRING = "This device has compute";
 
+/* We could have more chardevs to userspace */
+#define MAX_DEV 1
+
+static DEFINE_MUTEX(user_mutex);
+static DEFINE_SPINLOCK(touser_wr_lk);
+static DEFINE_SPINLOCK(touser_rd_lk);
+static DECLARE_KFIFO(touser_fifo, typeof(struct pci_epf_nvme_cmd *),
+		     PCI_EPF_NVME_FIFO_SIZE);
+DECLARE_WAIT_QUEUE_HEAD(touser_wq);
+static DEFINE_SPINLOCK(fromuser_lk);
+static DECLARE_KFIFO(fromuser_fifo, typeof(struct pci_epf_nvme_cmd *),
+		     PCI_EPF_NVME_FIFO_SIZE);
+DECLARE_WAIT_QUEUE_HEAD(fromuser_wq);
+
+static bool userpath_enabled = true;
+
 /*
  * Maximum data transfer size: limit to 128 KB to avoid excessive local
  * memory use for buffers.
  */
 #define PCI_EPF_NVME_MDTS		(128 * 1024)
-
+static int dev_major = 0;
 /* PRP manipulation macros */
 #define pci_epf_nvme_prp_addr(ctrl, prp)	((prp) & ~(ctrl)->mps_mask)
 #define pci_epf_nvme_prp_ofst(ctrl, prp)	((prp) & (ctrl)->mps_mask)
@@ -477,6 +494,7 @@ enum destination {
 	pci_epf_nvme_to_transfer,
 	pci_epf_nvme_to_backend,
 	pci_epf_nvme_to_read_relay,
+	pci_epf_nvme_to_user,
 };
 
 /*
@@ -679,6 +697,8 @@ struct pci_epf_nvme {
 	bool				dma_enable;
 
 	/* Towards Storage Processing (TSP) */
+	struct cdev			tsp_cdev;
+	struct class 			*tsp_class;
 	void				*tsp_alloc_ctx;
 	struct tsp_relay		*tsp_relays[TSP_RELAY_MAX_RELAYS];
 };
@@ -1305,6 +1325,42 @@ static inline void pci_epf_nvme_set_rxc_path(struct pci_epf_nvme_cmd *epcmd)
 	epcmd->path[2] = pci_epf_nvme_to_complete;
 }
 
+static inline void pci_epf_nvme_set_buxc_path(struct pci_epf_nvme_cmd *epcmd)
+{
+	epcmd->path[0] = pci_epf_nvme_to_backend;
+	epcmd->path[1] = pci_epf_nvme_to_user;
+	epcmd->path[2] = pci_epf_nvme_to_transfer;
+	epcmd->path[3] = pci_epf_nvme_to_complete;
+}
+
+static inline void pci_epf_nvme_set_xubc_path(struct pci_epf_nvme_cmd *epcmd)
+{
+	epcmd->path[0] = pci_epf_nvme_to_transfer;
+	epcmd->path[1] = pci_epf_nvme_to_user;
+	epcmd->path[2] = pci_epf_nvme_to_backend;
+	epcmd->path[3] = pci_epf_nvme_to_complete;
+}
+
+static inline void pci_epf_nvme_set_xuc_path(struct pci_epf_nvme_cmd *epcmd)
+{
+	epcmd->path[0] = pci_epf_nvme_to_transfer;
+	epcmd->path[1] = pci_epf_nvme_to_user;
+	epcmd->path[2] = pci_epf_nvme_to_complete;
+}
+
+static inline void pci_epf_nvme_set_uxc_path(struct pci_epf_nvme_cmd *epcmd)
+{
+	epcmd->path[0] = pci_epf_nvme_to_user;
+	epcmd->path[1] = pci_epf_nvme_to_transfer;
+	epcmd->path[2] = pci_epf_nvme_to_complete;
+}
+
+static inline void pci_epf_nvme_set_uc_path(struct pci_epf_nvme_cmd *epcmd)
+{
+	epcmd->path[0] = pci_epf_nvme_to_user;
+	epcmd->path[1] = pci_epf_nvme_to_complete;
+}
+
 static inline
 void pci_epf_nvme_send_cmd_to_completion(struct pci_epf_nvme_cmd *epcmd);
 static inline
@@ -1313,6 +1369,8 @@ static inline
 void pci_epf_nvme_send_cmd_to_xfer(struct pci_epf_nvme_cmd *epcmd);
 static inline
 void tsp_nvme_cmd_to_read_relay(struct pci_epf_nvme_cmd *epcmd);
+static inline
+void pci_epf_nvme_send_cmd_to_user(struct pci_epf_nvme_cmd *epcmd);
 
 static inline
 void pci_epf_nvme_send_cmd_to_next(struct pci_epf_nvme_cmd *epcmd)
@@ -1329,6 +1387,9 @@ void pci_epf_nvme_send_cmd_to_next(struct pci_epf_nvme_cmd *epcmd)
 		break;
 	case pci_epf_nvme_to_read_relay:
 		tsp_nvme_cmd_to_read_relay(epcmd);
+		break;
+	case pci_epf_nvme_to_user:
+		pci_epf_nvme_send_cmd_to_user(epcmd);
 		break;
 	default:
 		epcmd->status = NVME_SC_INTERNAL;
@@ -3700,6 +3761,53 @@ static inline size_t pci_epf_nvme_rw_data_len(struct pci_epf_nvme_cmd *epcmd)
 		epcmd->ns->lba_shift;
 }
 
+static inline
+void pci_epf_nvme_send_cmd_to_user(struct pci_epf_nvme_cmd *epcmd)
+{
+	/* XXX TODO Handle full FIFO XXX (unlikely) */
+
+	/* Lock because this is called from multiple threads */
+	kfifo_in_spinlocked(&touser_fifo, &epcmd, 1, &touser_wr_lk);
+	wake_up(&touser_wq);
+}
+
+void pci_epf_nvme_process_custom_io_cmd(struct pci_epf_nvme_cmd *epcmd)
+{
+	int ret;
+
+	switch (epcmd->cmd.common.opcode) {
+	case nvme_cmd_vendor_start:
+		pci_epf_nvme_set_uc_path(epcmd);
+		break;
+	case nvme_cmd_vendor_start + nvme_cmd_read:
+		epcmd->transfer_len = pci_epf_nvme_rw_data_len(epcmd);
+		epcmd->dir = DMA_TO_DEVICE;
+		/* Read from user space, not the same as backend read through
+		 * userspace */
+		pci_epf_nvme_set_uxc_path(epcmd);
+		break;
+	case nvme_cmd_vendor_start + nvme_cmd_write:
+		epcmd->transfer_len = pci_epf_nvme_rw_data_len(epcmd);
+		epcmd->dir = DMA_FROM_DEVICE;
+		pci_epf_nvme_set_xuc_path(epcmd);
+		break;
+	default:
+		epcmd->status = NVME_SC_INVALID_OPCODE | NVME_SC_DNR;
+		pci_epf_nvme_send_cmd_to_completion(epcmd);
+		return;
+	}
+
+	if (epcmd->transfer_len) {
+		/* Get an internal buffer for the command */
+		ret = pci_epf_nvme_alloc_cmd_buffer(epcmd);
+		if (ret) {
+			epcmd->status = NVME_SC_INTERNAL | NVME_SC_DNR;
+			pci_epf_nvme_send_cmd_to_completion(epcmd);
+		}
+	}
+	pci_epf_nvme_send_cmd_to_next(epcmd);
+}
+
 void pci_epf_nvme_process_io_cmd(struct pci_epf_nvme_cmd *epcmd)
 {
 	struct pci_epf_nvme *epf_nvme = epcmd->epf_nvme;
@@ -3717,6 +3825,11 @@ void pci_epf_nvme_process_io_cmd(struct pci_epf_nvme_cmd *epcmd)
 		goto complete;
 	}
 
+	if (cmd->common.opcode >= nvme_cmd_vendor_start) {
+		pci_epf_nvme_process_custom_io_cmd(epcmd);
+		return;
+	}
+
 	switch (cmd->common.opcode) {
 	case nvme_cmd_read:
 		if (!do_readwrite) {
@@ -3724,7 +3837,10 @@ void pci_epf_nvme_process_io_cmd(struct pci_epf_nvme_cmd *epcmd)
 			return;
 		}
 		epcmd->transfer_len = pci_epf_nvme_rw_data_len(epcmd);
-		pci_epf_nvme_set_bxc_path(epcmd);
+		if (userpath_enabled)
+			pci_epf_nvme_set_buxc_path(epcmd);
+		else
+			pci_epf_nvme_set_bxc_path(epcmd);
 		epcmd->dir = DMA_TO_DEVICE;
 		break;
 
@@ -3734,7 +3850,10 @@ void pci_epf_nvme_process_io_cmd(struct pci_epf_nvme_cmd *epcmd)
 			return;
 		}
 		epcmd->transfer_len = pci_epf_nvme_rw_data_len(epcmd);
-		pci_epf_nvme_set_xbc_path(epcmd);
+		if (userpath_enabled)
+			pci_epf_nvme_set_xubc_path(epcmd);
+		else
+			pci_epf_nvme_set_xbc_path(epcmd);
 		epcmd->dir = DMA_FROM_DEVICE;
 		break;
 
@@ -3885,6 +4004,205 @@ again:
 	queue_delayed_work(epf_nvme_reg_wq, &epf_nvme->reg_poll,
 			   msecs_to_jiffies(5));
 }
+
+struct tsp_file_data {
+	struct pci_epf_nvme		*epf_nvme;
+	struct pci_epf_nvme_cmd 	*epcmd;
+};
+
+/* Char device operations */
+static int tsp_open(struct inode *inode, struct file *file)
+{
+	struct pci_epf_nvme *epf_nvme = container_of(inode->i_cdev,
+						     struct pci_epf_nvme,
+						     tsp_cdev);
+
+	/* Allow only one process to open the file at a time */
+	if (!mutex_trylock(&user_mutex))
+		return -EBUSY;
+
+	struct tsp_file_data *tfd = kmalloc(sizeof(struct tsp_file_data),
+					    GFP_KERNEL);
+	if (!tfd) {
+		mutex_unlock(&user_mutex);
+		return -ENOMEM;
+	}
+
+	tfd->epf_nvme = epf_nvme;
+	tfd->epcmd = NULL;
+
+	file->private_data = tfd;
+
+	/* The private data is used to store the epcmd currently being worked on,
+	   this will allow to sync the read/write commands, then later use the
+	   offset maybe to handle multiple read async (note that this is very
+	   hacky...) */
+
+	return 0;
+}
+
+static int tsp_release(struct inode *inode, struct file *file)
+{
+	struct tsp_file_data *tfd = file->private_data;
+	struct pci_epf_nvme *epf_nvme = tfd->epf_nvme;
+
+	mutex_unlock(&user_mutex);
+
+	if (tfd->epcmd) {
+		/* If there is an unprocessed command queue it */
+		tfd->epcmd->status = NVME_SC_INTERNAL;
+		pci_epf_nvme_send_cmd_to_completion(tfd->epcmd);
+		tfd->epcmd = NULL;
+	}
+
+	kfree(tfd);
+
+	return 0;
+}
+
+static ssize_t tsp_read(struct file *file, char __user *buf, size_t count,
+			loff_t *offset)
+{
+	int ret;
+	struct tsp_file_data *tfd = file->private_data;
+	struct pci_epf_nvme *epf_nvme = tfd->epf_nvme;
+
+	if (!tfd) {
+		dev_err(&epf_nvme->epf->dev,
+			"Missing file data pointer !\n");
+		return -EFAULT;
+	}
+
+	if (count < sizeof(struct nvme_command))
+		return -EINVAL;
+
+	if (tfd->epcmd) {
+		dev_warn(&epf_nvme->epf->dev,
+			 "Cannot process multiple commands for the moment\n");
+		return -EINVAL;
+	}
+
+	spin_lock(&touser_rd_lk);
+	while (kfifo_is_empty(&touser_fifo)) {
+		spin_unlock(&touser_rd_lk);
+		if (file->f_flags & O_NONBLOCK) /* Do not block */
+			return 0;
+		ret = wait_event_interruptible(touser_wq,
+					       !kfifo_is_empty(&touser_fifo));
+		if (ret < 0) /* Interrupted by signal */
+			return 0;
+
+		spin_lock(&touser_rd_lk);
+	}
+
+	ret = kfifo_get(&touser_fifo, &tfd->epcmd);
+	spin_unlock(&touser_rd_lk);
+	if (ret != 1) {
+		dev_err(&epf_nvme->epf->dev,
+			"Could not get element from touser FIFO\n");
+		return -EFAULT;
+	}
+
+	if (!tfd->epcmd) {
+		dev_err(&epf_nvme->epf->dev,
+			"Missing epcmd pointer !\n");
+		return -EFAULT;
+	}
+
+	if (!buf) {
+		dev_err(&epf_nvme->epf->dev,
+			"Userspace buffer pointer seems to be NULL\n");
+		return -EFAULT;
+	}
+
+	if (count < (sizeof(tfd->epcmd->cmd) + sizeof(tfd->epcmd->buffer_size))) {
+		dev_err(&epf_nvme->epf->dev,
+			"Userspace buffer is too small\n");
+		/* Not we could requeue it as well ... */
+		goto fail_command;
+	}
+	ret = copy_to_user(buf, &tfd->epcmd->cmd, sizeof(tfd->epcmd->cmd));
+	if (ret) {
+		dev_err(&epf_nvme->epf->dev,
+			"Incomplete copy to user fail\n");
+		goto fail_command;
+	}
+	count = sizeof(tfd->epcmd->cmd);
+	if (tfd->epcmd->buffer && tfd->epcmd->buffer_size) {
+		ret = copy_to_user(buf + sizeof(tfd->epcmd->cmd),
+				   tfd->epcmd->buffer,
+				   tfd->epcmd->buffer_size);
+		if (ret) {
+			dev_err(&epf_nvme->epf->dev,
+				"Incomplete copy to user fail on buffer\n");
+			goto fail_command;
+		}
+	}
+	count += tfd->epcmd->buffer_size;
+
+	//dev_info(&epf_nvme->epf->dev, "TSP: Cmd read from userspace\n");
+	return count;
+
+fail_command:
+	tfd->epcmd->status = NVME_SC_INTERNAL;
+	pci_epf_nvme_send_cmd_to_completion(tfd->epcmd);
+	tfd->epcmd = NULL;
+	return -EFAULT;
+}
+
+static ssize_t tsp_write(struct file *file, const char __user *buf, size_t count,
+			 loff_t *offset)
+{
+	struct tsp_file_data *tfd = file->private_data;
+	struct pci_epf_nvme *epf_nvme = tfd->epf_nvme;
+
+	if (count < sizeof(struct nvme_completion))
+		return -EINVAL;
+
+	if (!tfd->epcmd) {
+		dev_warn(&epf_nvme->epf->dev,
+			 "No pending command, read by userspace first\n");
+		return -EINVAL;
+	}
+
+	if (copy_from_user(&tfd->epcmd->cqe, buf, sizeof(tfd->epcmd->cqe))) {
+		dev_err(&epf_nvme->epf->dev,
+			"Incomplete copy from user fail\n");
+		goto fail_command;
+	}
+	if (count > sizeof(tfd->epcmd->cqe) &&
+	    (count - sizeof(tfd->epcmd->cqe)) <= tfd->epcmd->buffer_size &&
+	    tfd->epcmd->buffer) {
+		if (copy_from_user(tfd->epcmd->buffer,
+				   buf + sizeof(tfd->epcmd->cqe),
+				   count - sizeof(tfd->epcmd->cqe))) {
+			dev_err(&epf_nvme->epf->dev,
+				"Incomplete copy from user fail on buffer\n");
+			goto fail_command;
+		}
+	}
+
+	dev_dbg(&epf_nvme->epf->dev, "TSP: Completion write from userspace\n");
+
+	pci_epf_nvme_send_cmd_to_next(tfd->epcmd);
+	tfd->epcmd = NULL;
+	return count;
+fail_command:
+	tfd->epcmd->status = NVME_SC_INTERNAL;
+	pci_epf_nvme_send_cmd_to_completion(tfd->epcmd);
+	tfd->epcmd = NULL;
+	return -EFAULT;
+}
+
+static const struct file_operations tsp_fops = {
+	.owner		= THIS_MODULE,
+	.open		= tsp_open,
+	.release	= tsp_release,
+	.read		= tsp_read,
+	.write		= tsp_write
+};
+
+/* End of char device operations */
 
 static int pci_epf_nvme_set_bars(struct pci_epf *epf)
 {
@@ -4268,8 +4586,9 @@ static struct pci_epf_header epf_nvme_pci_header = {
 static int pci_epf_nvme_probe(struct pci_epf *epf,
 			      const struct pci_epf_device_id *id)
 {
-	int ret;
+	int ret, i = 0;
 	struct pci_epf_nvme *epf_nvme;
+	dev_t dev;
 
 	epf_nvme = devm_kzalloc(&epf->dev, sizeof(*epf_nvme), GFP_KERNEL);
 	if (!epf_nvme)
@@ -4318,6 +4637,40 @@ static int pci_epf_nvme_probe(struct pci_epf *epf,
 
 	if (!read_stats || !write_stats)
 		return -ENOMEM;
+
+	INIT_KFIFO(touser_fifo);
+	mutex_init(&user_mutex);
+
+	/* allocate chardev region and assign Major number */
+	ret = alloc_chrdev_region(&dev, 0, MAX_DEV, "tspchardev");
+	if (ret) {
+		dev_err(&epf->dev, "Could not alloc chrdev region\n");
+		return ret;
+	}
+
+	dev_major = MAJOR(dev);
+
+	/* create sysfs class */
+	epf_nvme->tsp_class = class_create("tspchardev");
+	if (IS_ERR_OR_NULL(epf_nvme->tsp_class)) {
+		dev_err(&epf->dev, "Could not create class\n");
+		return PTR_ERR(epf_nvme->tsp_class);
+	}
+
+	/* init new device */
+	cdev_init(&epf_nvme->tsp_cdev, &tsp_fops);
+	epf_nvme->tsp_cdev.owner = THIS_MODULE;
+
+	/* Note: more entries could be created here */
+	/* add device to the system where "i" is the Minor number of the new device */
+	ret = cdev_add(&epf_nvme->tsp_cdev, MKDEV(dev_major, i), 1);
+	if (ret < 0) {
+		dev_err(&epf->dev, "Could not add character device\n");
+		return ret;
+	}
+
+	/* create device node /dev/mychardev-x where "x" is "i", equal to the Minor number */
+	device_create(epf_nvme->tsp_class, NULL, MKDEV(dev_major, i), NULL, "tsp-%d", i);
 
 	return 0;
 }
@@ -4718,6 +5071,7 @@ static struct pci_epf_ops pci_epf_nvme_ops = {
 	.add_cfs = pci_epf_nvme_add_cfs,
 };
 
+/* XXX TODO Remove function is missing XXX */
 static struct pci_epf_driver epf_nvme_driver = {
 	.driver.name	= "pci_epf_nvme",
 	.probe		= pci_epf_nvme_probe,
@@ -4729,7 +5083,6 @@ static struct pci_epf_driver epf_nvme_driver = {
 static int __init pci_epf_nvme_init(void)
 {
 	int ret;
-
 
 	epf_nvme_reg_wq = alloc_workqueue("epf_nvme_reg",
 					  WQ_MEM_RECLAIM | WQ_HIGHPRI, 0);
@@ -4779,6 +5132,14 @@ static void __exit pci_epf_nvme_exit(void)
 
 	kmem_cache_destroy(epf_nvme_cmd_cache);
 
+#if 0 /* XXX Should be moved to missing remove function */
+	device_destroy(tsp_class, MKDEV(dev_major, i));
+
+	class_unregister(tsp_class);
+	class_destroy(tsp_class);
+
+	unregister_chrdev_region(MKDEV(dev_major, 0), MINORMASK);
+#endif
 	pr_info("Unregistered driver\n");
 }
 module_exit(pci_epf_nvme_exit);
