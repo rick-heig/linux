@@ -57,6 +57,14 @@ static int num_xfer_threads = 1;
 DECLARE_WAIT_QUEUE_HEAD(xfer_wq);
 DECLARE_WAIT_QUEUE_HEAD(cq_wq);
 
+#define MAX_PATH_LEN	8
+
+enum destination {
+	pci_epf_nvme_to_complete = 0,
+	pci_epf_nvme_to_transfer,
+	pci_epf_nvme_to_backend,
+};
+
 /*
  * Host PCI memory segment for admin and IO commands.
  */
@@ -174,8 +182,8 @@ struct pci_epf_nvme_cmd {
 	struct nvme_completion		cqe;
 
 	enum dma_data_direction		dir;
-	bool				executed;
-	bool				pending_xfer_to_host;
+	int				next_destination;
+	__u8				path[MAX_PATH_LEN];
 	size_t				transfer_len;
 
 	/* Internal buffer that we will transfer over PCI */
@@ -579,7 +587,7 @@ static void pci_epf_nvme_init_cmd(struct pci_epf_nvme *epf_nvme,
 	epcmd->sqid = sqid;
 	epcmd->cqid = cqid;
 	epcmd->status = NVME_SC_SUCCESS;
-	/* executed, pending_xfer_to_host set to 0 by memset */
+	/* next_destination, path, set to 0 by memset */
 }
 
 static int pci_epf_nvme_alloc_cmd_buffer(struct pci_epf_nvme_cmd *epcmd)
@@ -689,10 +697,59 @@ xfer_err:
 	return -EIO;
 }
 
-static inline void pci_epf_nvme_queue_response(struct pci_epf_nvme_cmd *epcmd);
-static inline void pci_epf_nvme_dispatch_cmd(struct pci_epf_nvme_cmd *epcmd);
-static inline void pci_epf_nvme_dispatch_cmd_xfer_first(
-	struct pci_epf_nvme_cmd *epcmd);
+static inline void pci_epf_nvme_set_bc_path(struct pci_epf_nvme_cmd *epcmd)
+{
+	epcmd->path[0] = pci_epf_nvme_to_backend;
+	epcmd->path[1] = pci_epf_nvme_to_complete;
+}
+
+static inline void pci_epf_nvme_set_xc_path(struct pci_epf_nvme_cmd *epcmd)
+{
+	epcmd->path[0] = pci_epf_nvme_to_transfer;
+	epcmd->path[1] = pci_epf_nvme_to_complete;
+}
+
+static inline void pci_epf_nvme_set_xbc_path(struct pci_epf_nvme_cmd *epcmd)
+{
+	epcmd->path[0] = pci_epf_nvme_to_transfer;
+	epcmd->path[1] = pci_epf_nvme_to_backend;
+	epcmd->path[2] = pci_epf_nvme_to_complete;
+}
+
+static inline void pci_epf_nvme_set_bxc_path(struct pci_epf_nvme_cmd *epcmd)
+{
+	epcmd->path[0] = pci_epf_nvme_to_backend;
+	epcmd->path[1] = pci_epf_nvme_to_transfer;
+	epcmd->path[2] = pci_epf_nvme_to_complete;
+}
+
+static inline
+void pci_epf_nvme_send_cmd_to_completion(struct pci_epf_nvme_cmd *epcmd);
+static inline
+void pci_epf_nvme_send_cmd_to_backend(struct pci_epf_nvme_cmd *epcmd);
+static inline
+void pci_epf_nvme_send_cmd_to_xfer(struct pci_epf_nvme_cmd *epcmd);
+
+static inline
+void pci_epf_nvme_send_cmd_to_next(struct pci_epf_nvme_cmd *epcmd)
+{
+	switch (epcmd->path[epcmd->next_destination++]) {
+	case pci_epf_nvme_to_complete:
+		pci_epf_nvme_send_cmd_to_completion(epcmd);
+		break;
+	case pci_epf_nvme_to_transfer:
+		pci_epf_nvme_send_cmd_to_xfer(epcmd);
+		break;
+	case pci_epf_nvme_to_backend:
+		pci_epf_nvme_send_cmd_to_backend(epcmd);
+		break;
+	default:
+		epcmd->status = NVME_SC_INTERNAL;
+		pci_epf_nvme_send_cmd_to_completion(epcmd);
+		break;
+	}
+}
+
 static int pci_epf_nvme_cmd_parse_dptr(struct pci_epf_nvme_cmd *epcmd);
 
 static int pci_epf_nvme_xfer_thread_fn(void *arg)
@@ -732,24 +789,17 @@ static int pci_epf_nvme_xfer_thread_fn(void *arg)
 		/* Get the host buffer segments */
 		ret = pci_epf_nvme_cmd_parse_dptr(epcmd);
 		if (ret) {
-			pci_epf_nvme_queue_response(epcmd);
+			pci_epf_nvme_send_cmd_to_completion(epcmd);
 			continue;
 		}
 
 		ret = pci_epf_nvme_cmd_transfer(epcmd);
 		if (ret) {
-			pci_epf_nvme_queue_response(epcmd);
+			pci_epf_nvme_send_cmd_to_completion(epcmd);
 			continue;
 		}
 
-		/* In case the command has not yet been executed, dispatch it */
-		if (!epcmd->executed) {
-			pci_epf_nvme_dispatch_cmd(epcmd);
-			continue;
-		}
-
-		/* In all other cases queue completion */
-		pci_epf_nvme_queue_response(epcmd);
+		pci_epf_nvme_send_cmd_to_next(epcmd);
 	}
 }
 
@@ -875,7 +925,8 @@ static int pci_epf_nvme_completion_thread_fn(void *arg)
 	}
 }
 
-static inline void pci_epf_nvme_queue_response(struct pci_epf_nvme_cmd *epcmd)
+static inline
+void pci_epf_nvme_send_cmd_to_completion(struct pci_epf_nvme_cmd *epcmd)
 {
 	/* XXX TODO Handle full FIFO (unlikely) XXX */
 
@@ -1773,13 +1824,11 @@ static enum rq_end_io_ret pci_epf_nvme_backend_cmd_done_cb(struct request *req,
 	if (epcmd->status != NVME_SC_SUCCESS)
 		goto complete;
 
-	if (epcmd->pending_xfer_to_host) {
-		pci_epf_nvme_dispatch_cmd_xfer_first(epcmd);
-		return RQ_END_IO_NONE;
-	}
+	pci_epf_nvme_send_cmd_to_next(epcmd);
+	return RQ_END_IO_NONE;
 
 complete:
-	pci_epf_nvme_queue_response(epcmd);
+	pci_epf_nvme_send_cmd_to_completion(epcmd);
 	return RQ_END_IO_NONE;
 }
 
@@ -1841,8 +1890,6 @@ static void pci_epf_nvme_submit_sync_cmd(struct pci_epf_nvme *epf_nvme,
 	struct request_queue *q;
 	int ret;
 
-	epcmd->executed = true;
-
 	if (epcmd->ns)
 		q = epcmd->ns->queue;
 	else
@@ -1856,16 +1903,16 @@ static void pci_epf_nvme_submit_sync_cmd(struct pci_epf_nvme *epf_nvme,
 		epcmd->status = ret;
 }
 
-static inline void pci_epf_nvme_dispatch_cmd(struct pci_epf_nvme_cmd *epcmd)
+static inline
+void pci_epf_nvme_send_cmd_to_backend(struct pci_epf_nvme_cmd *epcmd)
 {
 	int ret;
-	epcmd->executed = true;
 	ret = pci_epf_nvme_submit_cmd_nowait(epcmd->epf_nvme, epcmd);
 	if (ret)
-		pci_epf_nvme_queue_response(epcmd);
+		pci_epf_nvme_send_cmd_to_completion(epcmd);
 }
 
-static inline void pci_epf_nvme_dispatch_cmd_xfer_first(
+static inline void pci_epf_nvme_send_cmd_to_xfer(
 	struct pci_epf_nvme_cmd *epcmd)
 {
 	/* XXX TODO Handle full FIFO XXX (unlikely) */
@@ -2006,13 +2053,13 @@ static void pci_epf_nvme_process_admin_cmd(struct pci_epf_nvme_cmd *epcmd)
 	case nvme_admin_identify:
 		post_process_hook = pci_epf_nvme_admin_identify_hook;
 		epcmd->transfer_len = NVME_IDENTIFY_DATA_SIZE;
-		epcmd->pending_xfer_to_host = true;
+		pci_epf_nvme_set_xc_path(epcmd);
 		epcmd->dir = DMA_TO_DEVICE;
 		break;
 
 	case nvme_admin_get_log_page:
 		epcmd->transfer_len = nvme_get_log_page_len(cmd);
-		epcmd->pending_xfer_to_host = true;
+		pci_epf_nvme_set_xc_path(epcmd);
 		epcmd->dir = DMA_TO_DEVICE;
 		break;
 
@@ -2068,19 +2115,17 @@ static void pci_epf_nvme_process_admin_cmd(struct pci_epf_nvme_cmd *epcmd)
 	/* Note this could also be dispatched */
 	pci_epf_nvme_submit_sync_cmd(epf_nvme, epcmd);
 	if (epcmd->status != NVME_SC_SUCCESS)
-		pci_epf_nvme_queue_response(epcmd);
+		pci_epf_nvme_send_cmd_to_completion(epcmd);
 
 	/* Command done: post process it and transfer data if needed */
 	if (post_process_hook)
 		post_process_hook(epf_nvme, epcmd);
-	if (epcmd->transfer_len) {
-		/* Dispatch means we don't have to handle the cmd anymore */
-		pci_epf_nvme_dispatch_cmd_xfer_first(epcmd);
-		return;
-	}
+
+	pci_epf_nvme_send_cmd_to_next(epcmd);
+	return;
 
 complete:
-	pci_epf_nvme_queue_response(epcmd);
+	pci_epf_nvme_send_cmd_to_completion(epcmd);
 }
 
 static inline size_t pci_epf_nvme_rw_data_len(struct pci_epf_nvme_cmd *epcmd)
@@ -2109,12 +2154,13 @@ void pci_epf_nvme_process_io_cmd(struct pci_epf_nvme_cmd *epcmd)
 	switch (cmd->common.opcode) {
 	case nvme_cmd_read:
 		epcmd->transfer_len = pci_epf_nvme_rw_data_len(epcmd);
-		epcmd->pending_xfer_to_host = true;
+		pci_epf_nvme_set_bxc_path(epcmd);
 		epcmd->dir = DMA_TO_DEVICE;
 		break;
 
 	case nvme_cmd_write:
 		epcmd->transfer_len = pci_epf_nvme_rw_data_len(epcmd);
+		pci_epf_nvme_set_xbc_path(epcmd);
 		epcmd->dir = DMA_FROM_DEVICE;
 		break;
 
@@ -2126,6 +2172,7 @@ void pci_epf_nvme_process_io_cmd(struct pci_epf_nvme_cmd *epcmd)
 
 	case nvme_cmd_flush:
 	case nvme_cmd_write_zeroes:
+		pci_epf_nvme_set_bc_path(epcmd);
 		break;
 
 	default:
@@ -2144,20 +2191,13 @@ void pci_epf_nvme_process_io_cmd(struct pci_epf_nvme_cmd *epcmd)
 			epcmd->status = NVME_SC_INTERNAL | NVME_SC_DNR;
 			goto complete;
 		}
-
-		/* Get data from the host if needed */
-		if (epcmd->dir == DMA_FROM_DEVICE) {
-			/* dispatch means we don't have to handle cmd anymore */
-			pci_epf_nvme_dispatch_cmd_xfer_first(epcmd);
-			return;
-		}
 	}
 
-	pci_epf_nvme_dispatch_cmd(epcmd);
+	pci_epf_nvme_send_cmd_to_next(epcmd);
 	return;
 
 complete:
-	pci_epf_nvme_queue_response(epcmd);
+	pci_epf_nvme_send_cmd_to_completion(epcmd);
 	return;
 }
 
