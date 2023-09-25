@@ -448,8 +448,6 @@ static DECLARE_KFIFO(touser_fifo, typeof(struct pci_epf_nvme_cmd *),
 		     PCI_EPF_NVME_FIFO_SIZE);
 DECLARE_WAIT_QUEUE_HEAD(touser_wq);
 
-static bool userpath_enabled = true;
-
 /*
  * Maximum data transfer size: limit to 128 KB to avoid excessive local
  * memory use for buffers.
@@ -701,6 +699,7 @@ struct pci_epf_nvme {
 	/* Towards Storage Processing (TSP) */
 	struct tsp_file_data		tsp_file_data[MAX_DEV];
 	struct class 			*tsp_class;
+	bool				user_path_enable;
 	void				*tsp_alloc_ctx;
 	struct tsp_relay		*tsp_relays[TSP_RELAY_MAX_RELAYS];
 };
@@ -3839,7 +3838,7 @@ void pci_epf_nvme_process_io_cmd(struct pci_epf_nvme_cmd *epcmd)
 			return;
 		}
 		epcmd->transfer_len = pci_epf_nvme_rw_data_len(epcmd);
-		if (userpath_enabled)
+		if (epf_nvme->user_path_enable)
 			pci_epf_nvme_set_buxc_path(epcmd);
 		else
 			pci_epf_nvme_set_bxc_path(epcmd);
@@ -3852,7 +3851,7 @@ void pci_epf_nvme_process_io_cmd(struct pci_epf_nvme_cmd *epcmd)
 			return;
 		}
 		epcmd->transfer_len = pci_epf_nvme_rw_data_len(epcmd);
-		if (userpath_enabled)
+		if (epf_nvme->user_path_enable)
 			pci_epf_nvme_set_xubc_path(epcmd);
 		else
 			pci_epf_nvme_set_xbc_path(epcmd);
@@ -4599,6 +4598,7 @@ static int pci_epf_nvme_probe(struct pci_epf *epf,
 
 	/* Set default attribute values */
 	epf_nvme->dma_enable = true;
+	epf_nvme->user_path_enable = false;
 
 	epf->event_ops = &pci_epf_nvme_event_ops;
 	epf->header = &epf_nvme_pci_header;
@@ -4750,6 +4750,31 @@ static ssize_t pci_epf_nvme_dma_enable_store(struct config_item *item,
 }
 
 CONFIGFS_ATTR(pci_epf_nvme_, dma_enable);
+
+static ssize_t pci_epf_nvme_user_path_enable_show(struct config_item *item,
+						  char *page)
+{
+	struct config_group *group = to_config_group(item);
+	struct pci_epf_nvme *epf_nvme = to_epf_nvme(group);
+
+	return sysfs_emit(page, "%d\n", epf_nvme->user_path_enable);
+}
+
+static ssize_t pci_epf_nvme_user_path_enable_store(struct config_item *item,
+						   const char *page, size_t len)
+{
+	struct config_group *group = to_config_group(item);
+	struct pci_epf_nvme *epf_nvme = to_epf_nvme(group);
+	int ret;
+
+	ret = kstrtobool(page, &epf_nvme->user_path_enable);
+	if (ret)
+		return ret;
+
+	return len;
+}
+
+CONFIGFS_ATTR(pci_epf_nvme_, user_path_enable);
 
 static ssize_t pci_epf_nvme_num_xfer_threads_show(struct config_item *item,
 						  char *page)
@@ -5015,6 +5040,7 @@ CONFIGFS_BIN_ATTR_RO(pci_epf_nvme_, wr_statistics, NULL, STATS_BUFFER_SIZE);
 static struct configfs_attribute *pci_epf_nvme_attrs[] = {
 	&pci_epf_nvme_attr_ctrl_opts,
 	&pci_epf_nvme_attr_dma_enable,
+	&pci_epf_nvme_attr_user_path_enable,
 	&pci_epf_nvme_attr_num_xfer_threads,
 	&pci_epf_nvme_attr_xfer_fifo,
 	&pci_epf_nvme_attr_completion_fifo,
