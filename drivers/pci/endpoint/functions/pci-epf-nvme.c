@@ -440,18 +440,13 @@ static CsCapabilities tsp_cs_caps = {
 static const char *TSP_CS_ID_STRING = "This device has compute";
 
 /* We could have more chardevs to userspace */
-#define MAX_DEV 1
+#define MAX_DEV 4
 
-static DEFINE_MUTEX(user_mutex);
 static DEFINE_SPINLOCK(touser_wr_lk);
 static DEFINE_SPINLOCK(touser_rd_lk);
 static DECLARE_KFIFO(touser_fifo, typeof(struct pci_epf_nvme_cmd *),
 		     PCI_EPF_NVME_FIFO_SIZE);
 DECLARE_WAIT_QUEUE_HEAD(touser_wq);
-static DEFINE_SPINLOCK(fromuser_lk);
-static DECLARE_KFIFO(fromuser_fifo, typeof(struct pci_epf_nvme_cmd *),
-		     PCI_EPF_NVME_FIFO_SIZE);
-DECLARE_WAIT_QUEUE_HEAD(fromuser_wq);
 
 static bool userpath_enabled = true;
 
@@ -656,6 +651,13 @@ struct pci_epf_nvme_cmd {
 	struct pci_epf_nvme_timestamps	ts;
 };
 
+struct tsp_file_data {
+	struct pci_epf_nvme		*epf_nvme;
+	struct pci_epf_nvme_cmd 	*epcmd;
+	struct cdev			cdev;
+	struct mutex			mutex;
+};
+
 /*
  * EPF function private data representing our NVMe subsystem.
  */
@@ -697,7 +699,7 @@ struct pci_epf_nvme {
 	bool				dma_enable;
 
 	/* Towards Storage Processing (TSP) */
-	struct cdev			tsp_cdev;
+	struct tsp_file_data		tsp_file_data[MAX_DEV];
 	struct class 			*tsp_class;
 	void				*tsp_alloc_ctx;
 	struct tsp_relay		*tsp_relays[TSP_RELAY_MAX_RELAYS];
@@ -4005,30 +4007,17 @@ again:
 			   msecs_to_jiffies(5));
 }
 
-struct tsp_file_data {
-	struct pci_epf_nvme		*epf_nvme;
-	struct pci_epf_nvme_cmd 	*epcmd;
-};
-
 /* Char device operations */
 static int tsp_open(struct inode *inode, struct file *file)
 {
-	struct pci_epf_nvme *epf_nvme = container_of(inode->i_cdev,
-						     struct pci_epf_nvme,
-						     tsp_cdev);
+	struct tsp_file_data *tfd = container_of(inode->i_cdev,
+						 struct tsp_file_data, cdev);
+	struct pci_epf_nvme *epf_nvme = tfd->epf_nvme;
 
 	/* Allow only one process to open the file at a time */
-	if (!mutex_trylock(&user_mutex))
+	if (!mutex_trylock(&tfd->mutex))
 		return -EBUSY;
 
-	struct tsp_file_data *tfd = kmalloc(sizeof(struct tsp_file_data),
-					    GFP_KERNEL);
-	if (!tfd) {
-		mutex_unlock(&user_mutex);
-		return -ENOMEM;
-	}
-
-	tfd->epf_nvme = epf_nvme;
 	tfd->epcmd = NULL;
 
 	file->private_data = tfd;
@@ -4044,9 +4033,9 @@ static int tsp_open(struct inode *inode, struct file *file)
 static int tsp_release(struct inode *inode, struct file *file)
 {
 	struct tsp_file_data *tfd = file->private_data;
-	struct pci_epf_nvme *epf_nvme = tfd->epf_nvme;
+	//struct pci_epf_nvme *epf_nvme = tfd->epf_nvme;
 
-	mutex_unlock(&user_mutex);
+	mutex_unlock(&tfd->mutex);
 
 	if (tfd->epcmd) {
 		/* If there is an unprocessed command queue it */
@@ -4054,8 +4043,6 @@ static int tsp_release(struct inode *inode, struct file *file)
 		pci_epf_nvme_send_cmd_to_completion(tfd->epcmd);
 		tfd->epcmd = NULL;
 	}
-
-	kfree(tfd);
 
 	return 0;
 }
@@ -4639,7 +4626,6 @@ static int pci_epf_nvme_probe(struct pci_epf *epf,
 		return -ENOMEM;
 
 	INIT_KFIFO(touser_fifo);
-	mutex_init(&user_mutex);
 
 	/* allocate chardev region and assign Major number */
 	ret = alloc_chrdev_region(&dev, 0, MAX_DEV, "tspchardev");
@@ -4657,20 +4643,28 @@ static int pci_epf_nvme_probe(struct pci_epf *epf,
 		return PTR_ERR(epf_nvme->tsp_class);
 	}
 
-	/* init new device */
-	cdev_init(&epf_nvme->tsp_cdev, &tsp_fops);
-	epf_nvme->tsp_cdev.owner = THIS_MODULE;
+	/* add device to the system where "i" is the Minor number of the new
+	 * device */
+	for (i = 0; i < MAX_DEV; ++i) {
+		/* init new device */
+		cdev_init(&epf_nvme->tsp_file_data[i].cdev, &tsp_fops);
+		epf_nvme->tsp_file_data[i].cdev.owner = THIS_MODULE;
 
-	/* Note: more entries could be created here */
-	/* add device to the system where "i" is the Minor number of the new device */
-	ret = cdev_add(&epf_nvme->tsp_cdev, MKDEV(dev_major, i), 1);
-	if (ret < 0) {
-		dev_err(&epf->dev, "Could not add character device\n");
-		return ret;
+		ret = cdev_add(&epf_nvme->tsp_file_data[i].cdev,
+			       MKDEV(dev_major, i), 1);
+		if (ret < 0) {
+			dev_err(&epf->dev, "Could not add character device\n");
+			return ret;
+		}
+
+		/* create device node /dev/mychardev-x where "x" is "i", equal
+		 * to the Minor number */
+		device_create(epf_nvme->tsp_class, NULL, MKDEV(dev_major, i),
+			      NULL, "tsp-%d", i);
+
+		epf_nvme->tsp_file_data[i].epf_nvme = epf_nvme;
+		mutex_init(&epf_nvme->tsp_file_data[i].mutex);
 	}
-
-	/* create device node /dev/mychardev-x where "x" is "i", equal to the Minor number */
-	device_create(epf_nvme->tsp_class, NULL, MKDEV(dev_major, i), NULL, "tsp-%d", i);
 
 	return 0;
 }
