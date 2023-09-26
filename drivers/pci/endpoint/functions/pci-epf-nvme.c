@@ -1356,6 +1356,13 @@ static inline void pci_epf_nvme_set_uxc_path(struct pci_epf_nvme_cmd *epcmd)
 	epcmd->path[2] = pci_epf_nvme_to_complete;
 }
 
+static inline void pci_epf_nvme_set_ubc_path(struct pci_epf_nvme_cmd *epcmd)
+{
+	epcmd->path[0] = pci_epf_nvme_to_user;
+	epcmd->path[1] = pci_epf_nvme_to_backend;
+	epcmd->path[2] = pci_epf_nvme_to_complete;
+}
+
 static inline void pci_epf_nvme_set_uc_path(struct pci_epf_nvme_cmd *epcmd)
 {
 	epcmd->path[0] = pci_epf_nvme_to_user;
@@ -3865,8 +3872,18 @@ void pci_epf_nvme_process_io_cmd(struct pci_epf_nvme_cmd *epcmd)
 		goto complete;
 
 	case nvme_cmd_flush:
-	case nvme_cmd_write_zeroes:
 		pci_epf_nvme_set_bc_path(epcmd);
+		break;
+
+	case nvme_cmd_write_zeroes:
+		if (epf_nvme->user_path_enable) {
+			/* Convert to a write command so that userspace can
+			 * modiffy the data, e.g., for encryption */
+			epcmd->transfer_len = pci_epf_nvme_rw_data_len(epcmd);
+			epcmd->cmd.common.opcode = nvme_cmd_write;
+			pci_epf_nvme_set_ubc_path(epcmd);
+		} else
+			pci_epf_nvme_set_bc_path(epcmd);
 		break;
 
 	default:
