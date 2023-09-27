@@ -23,6 +23,7 @@
 #include <linux/atomic.h>
 #include <linux/kthread.h>
 #include <linux/cdev.h>
+#include <linux/uio_driver.h>
 #include <net/sock.h>
 #include <generated/utsrelease.h>
 
@@ -697,6 +698,7 @@ struct pci_epf_nvme {
 	bool				dma_enable;
 
 	/* Towards Storage Processing (TSP) */
+	struct uio_info			uio_info;
 	struct tsp_file_data		tsp_file_data[MAX_DEV];
 	struct class 			*tsp_class;
 	bool				user_path_enable;
@@ -4551,6 +4553,21 @@ static int pci_epf_nvme_bind(struct pci_epf *epf)
 
 	dev_info(&epf->dev, "DMAs %sabled\n",
 		 (epf_nvme->dma_enable ? "en" : "dis"));
+
+	epf_nvme->uio_info.mem[0].name = "CMB";
+	epf_nvme->uio_info.mem[0].addr = epf_nvme->epf->bar[CMB_BIR].phys_addr;
+	dev_dbg(&epf_nvme->epf->dev, "Mem0 addr: %#016llx\n",
+		epf_nvme->uio_info.mem[0].addr);
+	epf_nvme->uio_info.mem[0].internal_addr = epf_nvme->epf->bar[CMB_BIR].addr;
+	epf_nvme->uio_info.mem[0].size = epf_nvme->epf->bar[CMB_BIR].size;
+	dev_dbg(&epf_nvme->epf->dev, "Mem0 size: %llu\n",
+		epf_nvme->uio_info.mem[0].size);
+	epf_nvme->uio_info.mem[0].memtype = UIO_MEM_PHYS;
+	epf_nvme->uio_info.version = "0.0.1";
+	epf_nvme->uio_info.name = "TSP_NVMe";
+
+	if (uio_register_device(&epf_nvme->epf->dev, &epf_nvme->uio_info))
+		dev_err(&epf_nvme->epf->dev, "Could not register UIO device\n");
 
 	if (!epc_features->linkup_notifier && !epc_features->core_init_notifier)
 		queue_delayed_work(epf_nvme_reg_wq, &epf_nvme->reg_poll,
