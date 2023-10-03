@@ -368,6 +368,9 @@ typedef enum {
 	TSP_CS_ALLOCATE = 16,
 	TSP_CS_DEALLOCATE = 17,
 	TSP_CS_COMPUTE = 32,
+	TSP_CS_COMM = 64,
+	TSP_CS_OPEN_RELAY = 128,
+	TSP_CS_CLOSE_RELAY = 129,
 } TSP_CDW10;
 
 typedef enum {
@@ -376,9 +379,6 @@ typedef enum {
 	TSP_CS_CAPS = 16,
 	TSP_CS_FUN = 32,
 	TSP_CS_MEM = 64,
-	TSP_CS_COMM = 64,
-	TSP_CS_OPEN_RELAY = 128,
-	TSP_CS_CLOSE_RELAY = 129,
 } TSP_CDW11;
 
 enum {
