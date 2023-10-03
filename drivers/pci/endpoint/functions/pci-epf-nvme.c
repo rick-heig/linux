@@ -5139,6 +5139,19 @@ static ssize_t pci_epf_nvme_poll_relaxed_delay_usecs_store(struct config_item *i
 }
 
 CONFIGFS_ATTR(pci_epf_nvme_, poll_relaxed_delay_usecs);
+static ssize_t pci_epf_nvme_cba_show(struct config_item *item, char *page)
+{
+	struct config_group *group = to_config_group(item);
+	struct pci_epf_nvme *epf_nvme = to_epf_nvme(group);
+	u64 cmbmsc, cba;
+
+	cmbmsc = pci_epf_nvme_reg_read64(&epf_nvme->ctrl, NVME_REG_CMBMSC);
+	cba = cmbmsc & CMBMSC_CBA_MASK;
+
+	return sysfs_emit(page, "%#016llx\n", cba);
+}
+
+CONFIGFS_ATTR_RO(pci_epf_nvme_, cba);
 
 static ssize_t pci_epf_nvme_statistics_show(struct config_item *item,
 					    char *page)
@@ -5229,6 +5242,7 @@ static struct configfs_attribute *pci_epf_nvme_attrs[] = {
 	&pci_epf_nvme_attr_relaxed_poll_threshold,
 	&pci_epf_nvme_attr_poll_delay_usecs,
 	&pci_epf_nvme_attr_poll_relaxed_delay_usecs,
+	&pci_epf_nvme_attr_cba,
 	&pci_epf_nvme_attr_statistics,
 	&pci_epf_nvme_attr_collect_size_filter,
 	&pci_epf_nvme_attr_statistics_buffer_size,
