@@ -368,6 +368,7 @@ typedef enum {
 	TSP_CS_ALLOCATE = 16,
 	TSP_CS_DEALLOCATE = 17,
 	TSP_CS_COMPUTE = 32,
+	TSP_CS_COMPUTE_USER_SPACE = 33,
 	TSP_CS_COMM = 64,
 	TSP_CS_OPEN_RELAY = 128,
 	TSP_CS_CLOSE_RELAY = 129,
@@ -3192,6 +3193,25 @@ static u16 tsp_nvme_cs_compute(struct pci_epf_nvme *nvme,
 	return NVME_SC_SUCCESS;
 }
 
+static u16 tsp_nvme_cs_compute_user_space(struct pci_epf_nvme *nvme,
+					  struct pci_epf_nvme_cmd *epcmd)
+{
+	u16 ret;
+
+	/* Data transfer of the compute instruction is done here */
+	ret = pci_epf_nvme_h2c(nvme, SZ_4K, epcmd);
+	if (ret != NVME_SC_SUCCESS)
+		return ret;
+
+	/* So only send it to user space then to completion */
+	pci_epf_nvme_set_uc_path(epcmd);
+
+	pci_epf_nvme_send_cmd_to_next(epcmd);
+
+	/* Dirty way to tell the caller not to enqueue the completion */
+	return -1;
+}
+
 u32 tsp_inet_addr(const char *str) {
 	int ret;
 	u32 addr;
@@ -3648,6 +3668,8 @@ static u16 pci_epf_nvme_process_custom_admin_cmd(struct pci_epf_nvme *nvme,
 		return tsp_nvme_cs_mm(epcmd);
 	case TSP_CS_COMPUTE:
 		return tsp_nvme_cs_compute(nvme, epcmd);
+	case TSP_CS_COMPUTE_USER_SPACE:
+		return tsp_nvme_cs_compute_user_space(nvme, epcmd);
 	case TSP_CS_COMM:
 		return tsp_nvme_cs_comm(nvme, epcmd);
 	case TSP_CS_OPEN_RELAY:
