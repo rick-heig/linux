@@ -362,6 +362,14 @@ typedef struct {
 			       // arguments
 } __attribute__((packed)) CsComputeRequest;
 
+/* This has the data direction set correctly per specifications */
+typedef enum {
+	TSP_COMPUTE_CMD = 0xC8,
+	TSP_COMPUTE_CMD_H2C = 0xC9,
+	TSP_COMPUTE_CMD_C2H = 0xCA,
+	TSP_COMPUTE_CMD_H2C2H = 0xCB,
+} TSP_OPCODE;
+
 typedef enum {
 	TSP_CS_IDENTIFY = 0,
 	TSP_CS_GET = 8,
@@ -1366,6 +1374,14 @@ static inline void pci_epf_nvme_set_uxc_path(struct pci_epf_nvme_cmd *epcmd)
 	epcmd->path[0] = pci_epf_nvme_to_user;
 	epcmd->path[1] = pci_epf_nvme_to_transfer;
 	epcmd->path[2] = pci_epf_nvme_to_complete;
+}
+
+static inline void pci_epf_nvme_set_xuxc_path(struct pci_epf_nvme_cmd *epcmd)
+{
+	epcmd->path[0] = pci_epf_nvme_to_transfer;
+	epcmd->path[1] = pci_epf_nvme_to_user;
+	epcmd->path[2] = pci_epf_nvme_to_transfer;
+	epcmd->path[3] = pci_epf_nvme_to_complete;
 }
 
 static inline void pci_epf_nvme_set_ubc_path(struct pci_epf_nvme_cmd *epcmd)
@@ -3212,6 +3228,62 @@ static u16 tsp_nvme_cs_compute_user_space(struct pci_epf_nvme *nvme,
 	return -1;
 }
 
+/* For testing new data transfer aware opcodes */
+static u16 tsp_nvme_cs_compute_user_space2(struct pci_epf_nvme *nvme,
+					   struct pci_epf_nvme_cmd *epcmd)
+{
+	u16 ret;
+
+	/* For the moment all compute commands transfer 4kB
+	   TODO implement proper transfer size */
+	switch (epcmd->cmd.common.opcode) {
+	case TSP_COMPUTE_CMD:
+		/* No transfer between controller and host */
+		pci_epf_nvme_set_uc_path(epcmd);
+		break;
+	case TSP_COMPUTE_CMD_H2C:
+		/* We do the transfer here directly */
+		ret = pci_epf_nvme_h2c(nvme, SZ_4K, epcmd);
+		if (ret != NVME_SC_SUCCESS)
+			return ret;
+		pci_epf_nvme_set_uc_path(epcmd);
+		// TODO INIT BUFFER AND SIZE
+		//pci_epf_nvme_set_xuc_path(epcmd);
+		break;
+	case TSP_COMPUTE_CMD_C2H:
+		// TODO INIT BUFFER AND SIZE
+		epcmd->transfer_len = SZ_4K;
+		epcmd->dir = DMA_TO_DEVICE;
+		/* Get an internal buffer for the command */
+		ret = pci_epf_nvme_alloc_cmd_buffer(epcmd);
+		if (ret < 0) {
+			epcmd->status = NVME_SC_DATA_XFER_ERROR;
+			pci_epf_nvme_send_cmd_to_completion(epcmd);
+			return -1;
+		}
+		pci_epf_nvme_set_uxc_path(epcmd);
+		break;
+	case TSP_COMPUTE_CMD_H2C2H:
+		/* We do the transfer here directly */
+		ret = pci_epf_nvme_h2c(nvme, SZ_4K, epcmd);
+		if (ret != NVME_SC_SUCCESS)
+			return ret;
+		/* Change direction for the next transfer, buf already alloc'd */
+		epcmd->dir = DMA_TO_DEVICE;
+		pci_epf_nvme_set_uxc_path(epcmd);
+		//pci_epf_nvme_set_xuxc_path(epcmd);
+		break;
+	default:
+		dev_warn(&nvme->epf->dev, "Unknown compute commande opcode\n");
+		epcmd->status = NVME_SC_INVALID_OPCODE;
+		pci_epf_nvme_send_cmd_to_completion(epcmd);
+		return -1;
+	}
+
+	pci_epf_nvme_send_cmd_to_next(epcmd);
+	return -1;
+}
+
 u32 tsp_inet_addr(const char *str) {
 	int ret;
 	u32 addr;
@@ -3694,9 +3766,13 @@ static void pci_epf_nvme_process_admin_cmd(struct pci_epf_nvme_cmd *epcmd)
 
 	if (epcmd->cmd.common.opcode >= nvme_admin_vendor_start) {
 		if (epcmd->cmd.common.opcode == 0xCC) {
-			/* Redirect these commands to user space */
+			/* Redirect these commands to user space (testing) */
 			pci_epf_nvme_set_uc_path(epcmd);
 			return;
+		} else if (epcmd->cmd.common.opcode >= 0xC8 &&
+			   epcmd->cmd.common.opcode <= 0xCB) {
+			/* These all go to user space for the moment */
+			status = tsp_nvme_cs_compute_user_space2(epf_nvme, epcmd);
 		} else {
 			status = pci_epf_nvme_process_custom_admin_cmd(epf_nvme,
 								       epcmd);
