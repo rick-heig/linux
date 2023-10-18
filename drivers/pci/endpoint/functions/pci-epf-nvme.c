@@ -240,6 +240,8 @@ struct pci_epf_nvme {
 	unsigned int			max_nr_queues;
 
 	struct pci_epf_nvme_ctrl	ctrl;
+	struct pci_epf_nvme_queue	*currently_mapped_sq;
+	struct pci_epf_nvme_queue	*currently_mapped_cq;
 
 	/* Function configfs attributes */
 	struct config_group		group;
@@ -895,22 +897,52 @@ static inline int pci_epf_nvme_map_q(struct pci_epf_nvme *epf_nvme,
 
 static inline void pci_epf_nvme_unmap_sq(struct pci_epf_nvme *epf_nvme, int qid)
 {
-	pci_epf_nvme_unmap_q(epf_nvme, &epf_nvme->ctrl.sq[qid]);
+	struct pci_epf_nvme_queue *sq = &epf_nvme->ctrl.sq[qid];
+	if (epf_nvme->currently_mapped_sq == sq)
+		epf_nvme->currently_mapped_sq = NULL;
+	pci_epf_nvme_unmap_q(epf_nvme, sq);
 }
 
-static int pci_epf_nvme_map_sq(struct pci_epf_nvme *epf_nvme, int qid)
+static inline int pci_epf_nvme_map_sq(struct pci_epf_nvme *epf_nvme, int qid)
 {
-	return pci_epf_nvme_map_q(epf_nvme, &epf_nvme->ctrl.sq[qid]);
+	struct pci_epf_nvme_queue *sq = &epf_nvme->ctrl.sq[qid];
+	int ret = 0;
+	if (epf_nvme->currently_mapped_sq != sq) {
+		if (epf_nvme->currently_mapped_sq)
+			pci_epf_nvme_unmap_q(epf_nvme,
+				             epf_nvme->currently_mapped_sq);
+		ret = pci_epf_nvme_map_q(epf_nvme, sq);
+		if (ret)
+			epf_nvme->currently_mapped_sq = NULL;
+		else
+			epf_nvme->currently_mapped_sq = sq;
+	}
+	return ret;
 }
 
 static inline void pci_epf_nvme_unmap_cq(struct pci_epf_nvme *epf_nvme, int qid)
 {
-	pci_epf_nvme_unmap_q(epf_nvme, &epf_nvme->ctrl.cq[qid]);
+	struct pci_epf_nvme_queue *cq = &epf_nvme->ctrl.cq[qid];
+	if (epf_nvme->currently_mapped_cq == cq)
+		epf_nvme->currently_mapped_cq = NULL;
+	pci_epf_nvme_unmap_q(epf_nvme, cq);
 }
 
-static int pci_epf_nvme_map_cq(struct pci_epf_nvme *epf_nvme, int qid)
+static inline int pci_epf_nvme_map_cq(struct pci_epf_nvme *epf_nvme, int qid)
 {
-	return pci_epf_nvme_map_q(epf_nvme, &epf_nvme->ctrl.cq[qid]);
+	struct pci_epf_nvme_queue *cq = &epf_nvme->ctrl.cq[qid];
+	int ret = 0;
+	if (epf_nvme->currently_mapped_cq != cq) {
+		if (epf_nvme->currently_mapped_cq)
+			pci_epf_nvme_unmap_q(epf_nvme,
+				             epf_nvme->currently_mapped_cq);
+		ret = pci_epf_nvme_map_q(epf_nvme, cq);
+		if (ret)
+			epf_nvme->currently_mapped_cq = NULL;
+		else
+			epf_nvme->currently_mapped_cq = cq;
+	}
+	return ret;
 }
 
 static inline void __pci_epf_nvme_queue_response(struct pci_epf_nvme_cmd *epcmd)
@@ -949,21 +981,14 @@ static inline void __pci_epf_nvme_queue_response(struct pci_epf_nvme_cmd *epcmd)
 		epcmd->cqid, epcmd->status, cq->phase, cq->tail,
 		(int)cq->tail, (int)cq->depth);
 
-	if (pci_epf_nvme_map_cq(epf_nvme, cq->qid) == 0) {
-		memcpy_toio(cq->map.virt_addr + cq->tail * cq->qes, cqe,
-			    sizeof(struct nvme_completion));
-		pci_epf_nvme_unmap_cq(epf_nvme, cq->qid);
-	} else {
-		/* This should not happen, the map has been tested during queue
-		   initialization, so if map fails it means the PCI controller
-		   either doesn't work anymore, and here we can't do anyhting
-		   about it, either to many window mappings are in use and this
-		   would be the result of developper error in this driver */
-		dev_err(&epcmd->epf_nvme->epf->dev,
-			"QID %d: command %s (0x%x) not sent, status 0x%0x\n",
-			epcmd->cqid, pci_epf_nvme_cmd_name(epcmd),
-			epcmd->cmd.common.opcode, epcmd->status);
-	}
+	/* This should not happen, the map has been tested during queue
+		initialization, so if map fails it means the PCI controller
+		either doesn't work anymore, and here we can't do anyhting
+		about it, either to many window mappings are in use and this
+		would be the result of developper error in this driver */
+	WARN_ON_ONCE(pci_epf_nvme_map_cq(epf_nvme, epcmd->cqid));
+	memcpy_toio(cq->map.virt_addr + cq->tail * cq->qes, cqe,
+			sizeof(struct nvme_completion));
 
 	/* Advance cq tail */
 	cq->tail++;
@@ -1059,7 +1084,8 @@ static inline int pci_epf_nvme_fetch_sqes(struct pci_epf_nvme *epf_nvme, int qid
 		sq->local_tail = sq->tail;
 	}
 
-	pci_epf_nvme_unmap_sq(epf_nvme, qid);
+	// map will auto unmap
+	//pci_epf_nvme_unmap_sq(epf_nvme, qid);
 
 	return num_cmds;
 }
@@ -1733,6 +1759,9 @@ static void pci_epf_nvme_disable_ctrl(struct pci_epf_nvme *epf_nvme,
 	for (qid = ctrl->nr_queues - 1; qid >= 0; qid--)
 		pci_epf_nvme_clean_cq(epf_nvme, qid);
 
+	epf_nvme->currently_mapped_sq = NULL;
+	epf_nvme->currently_mapped_cq = NULL;
+
 	if (shutdown) {
 		pci_epf_nvme_delete_ctrl(epf);
 		ctrl->cc &= ~NVME_CC_SHN_NORMAL;
@@ -1798,6 +1827,9 @@ static void pci_epf_nvme_enable_ctrl(struct pci_epf_nvme *epf_nvme)
 		pci_epf_nvme_clean_cq(epf_nvme, 0);
 		return;
 	}
+
+	epf_nvme->currently_mapped_sq = NULL;
+	epf_nvme->currently_mapped_cq = NULL;
 
 	/* Controller is no longer disabled */
 	epf_nvme->disabled = false;
