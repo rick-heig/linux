@@ -2873,10 +2873,32 @@ static ssize_t pci_epf_nvme_num_xfer_threads_store(struct config_item *item,
 
 CONFIGFS_ATTR(pci_epf_nvme_, num_xfer_threads);
 
+static ssize_t pci_epf_nvme_xfer_fifo_show(struct config_item *item,
+					   char *page)
+{
+	struct config_group *group = to_config_group(item);
+	struct pci_epf_nvme *epf_nvme = to_epf_nvme(group);
+
+	return sysfs_emit(page, "%u\n", kfifo_len(&epf_nvme->xfer_fifo));
+}
+CONFIGFS_ATTR_RO(pci_epf_nvme_, xfer_fifo);
+
+static ssize_t pci_epf_nvme_completion_fifo_show(struct config_item *item,
+						 char *page)
+{
+	struct config_group *group = to_config_group(item);
+	struct pci_epf_nvme *epf_nvme = to_epf_nvme(group);
+
+	return sysfs_emit(page, "%u\n", kfifo_len(&epf_nvme->completion_fifo));
+}
+CONFIGFS_ATTR_RO(pci_epf_nvme_, completion_fifo);
+
 static struct configfs_attribute *pci_epf_nvme_attrs[] = {
 	&pci_epf_nvme_attr_ctrl_opts,
 	&pci_epf_nvme_attr_dma_enable,
 	&pci_epf_nvme_attr_num_xfer_threads,
+	&pci_epf_nvme_attr_xfer_fifo,
+	&pci_epf_nvme_attr_completion_fifo,
 	NULL,
 };
 
