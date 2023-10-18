@@ -39,6 +39,11 @@
 #define PCI_EPF_NVME_FIFO_SIZE 1024
 
 /*
+ * Maximum number of IO queues supported
+ */
+#define PCI_EPF_NVME_MAX_IO_QUEUES 32
+
+/*
  * Maximum data transfer size: limit to 128 KB to avoid excessive local
  * memory use for buffers.
  */
@@ -844,6 +849,66 @@ static inline bool pci_epf_nvme_ctrl_ready(struct pci_epf_nvme_ctrl *ctrl)
 	return (ctrl->cc & NVME_CC_ENABLE) && (ctrl->csts & NVME_CSTS_RDY);
 }
 
+static inline void pci_epf_nvme_unmap_q(struct pci_epf_nvme *epf_nvme,
+					struct pci_epf_nvme_queue *q)
+{
+	if (q->mapped) {
+		pci_epf_mem_unmap(epf_nvme->epf, &q->map);
+		q->mapped = false;
+	}
+}
+
+static inline int pci_epf_nvme_map_q(struct pci_epf_nvme *epf_nvme,
+				     struct pci_epf_nvme_queue *q)
+{
+	struct pci_epf *epf = epf_nvme->epf;
+	size_t qsize = q->qes * q->depth;
+	int ret;
+
+	if (q->mapped)
+		return 0;
+
+	ret = pci_epf_mem_map(epf, q->pci_addr, qsize, &q->map);
+	if (ret != qsize) {
+		if (ret > 0) {
+			dev_err(&epf->dev, "Partial queue %d mapping\n", q->qid);
+			pci_epf_mem_unmap(epf, &q->map);
+			ret = -ENOMEM;
+		} else {
+			dev_err(&epf->dev, "Map queue %d failed\n", q->qid);
+		}
+		return ret;
+	}
+
+	q->mapped = true;
+
+	dev_dbg(&epf->dev,
+		"Queue %d: PCI addr 0x%llx, virt addr 0x%llx, size %zu B\n",
+		q->qid, q->map.pci_addr, (u64)q->map.virt_addr, qsize);
+
+	return 0;
+}
+
+static inline void pci_epf_nvme_unmap_sq(struct pci_epf_nvme *epf_nvme, int qid)
+{
+	pci_epf_nvme_unmap_q(epf_nvme, &epf_nvme->ctrl.sq[qid]);
+}
+
+static int pci_epf_nvme_map_sq(struct pci_epf_nvme *epf_nvme, int qid)
+{
+	return pci_epf_nvme_map_q(epf_nvme, &epf_nvme->ctrl.sq[qid]);
+}
+
+static inline void pci_epf_nvme_unmap_cq(struct pci_epf_nvme *epf_nvme, int qid)
+{
+	pci_epf_nvme_unmap_q(epf_nvme, &epf_nvme->ctrl.cq[qid]);
+}
+
+static int pci_epf_nvme_map_cq(struct pci_epf_nvme *epf_nvme, int qid)
+{
+	return pci_epf_nvme_map_q(epf_nvme, &epf_nvme->ctrl.cq[qid]);
+}
+
 static inline void __pci_epf_nvme_queue_response(struct pci_epf_nvme_cmd *epcmd)
 {
 	struct pci_epf_nvme *epf_nvme = epcmd->epf_nvme;
@@ -880,8 +945,21 @@ static inline void __pci_epf_nvme_queue_response(struct pci_epf_nvme_cmd *epcmd)
 		epcmd->cqid, epcmd->status, cq->phase, cq->tail,
 		(int)cq->tail, (int)cq->depth);
 
-	memcpy_toio(cq->map.virt_addr + cq->tail * cq->qes, cqe,
-		    sizeof(struct nvme_completion));
+	if (pci_epf_nvme_map_cq(epf_nvme, cq->qid) == 0) {
+		memcpy_toio(cq->map.virt_addr + cq->tail * cq->qes, cqe,
+			    sizeof(struct nvme_completion));
+		pci_epf_nvme_unmap_cq(epf_nvme, cq->qid);
+	} else {
+		/* This should not happen, the map has been tested during queue
+		   initialization, so if map fails it means the PCI controller
+		   either doesn't work anymore, and here we can't do anyhting
+		   about it, either to many window mappings are in use and this
+		   would be the result of developper error in this driver */
+		dev_err(&epcmd->epf_nvme->epf->dev,
+			"QID %d: command %s (0x%x) not sent, status 0x%0x\n",
+			epcmd->cqid, pci_epf_nvme_cmd_name(epcmd),
+			epcmd->cmd.common.opcode, epcmd->status);
+	}
 
 	/* Advance cq tail */
 	cq->tail++;
@@ -934,47 +1012,6 @@ void pci_epf_nvme_send_cmd_to_completion(struct pci_epf_nvme_cmd *epcmd)
 	kfifo_in_spinlocked(&epcmd->epf_nvme->completion_fifo, &epcmd, 1,
 			    &epcmd->epf_nvme->completion_fifo_wr_lock);
 	wake_up(&cq_wq);
-}
-
-static inline void pci_epf_nvme_unmap_sq(struct pci_epf_nvme *epf_nvme, int qid)
-{
-	struct pci_epf_nvme_queue *sq = &epf_nvme->ctrl.sq[qid];
-	if (sq->mapped) {
-		pci_epf_mem_unmap(epf_nvme->epf, &sq->map);
-		sq->mapped = false;
-	}
-}
-
-static int pci_epf_nvme_map_sq(struct pci_epf_nvme *epf_nvme, int qid)
-{
-	struct pci_epf *epf = epf_nvme->epf;
-	struct pci_epf_nvme_ctrl *ctrl = &epf_nvme->ctrl;
-	struct pci_epf_nvme_queue *sq = &ctrl->sq[qid];
-	size_t qsize = sq->qes * sq->depth;
-	int ret;
-
-	if (sq->mapped)
-		return 0;
-
-	ret = pci_epf_mem_map(epf, sq->pci_addr, qsize, &sq->map);
-	if (ret != qsize) {
-		if (ret > 0) {
-			dev_err(&epf->dev, "Partial SQ %d mapping\n", qid);
-			pci_epf_mem_unmap(epf, &sq->map);
-			ret = -ENOMEM;
-		} else {
-			dev_err(&epf->dev, "Map SQ %d failed\n", qid);
-		}
-		return ret;
-	}
-
-	sq->mapped = true;
-
-	dev_dbg(&epf->dev,
-		"SQ %d: PCI addr 0x%llx, virt addr 0x%llx, size %zu B\n",
-		qid, sq->map.pci_addr, (u64)sq->map.virt_addr, qsize);
-
-	return 0;
 }
 
 static inline int pci_epf_nvme_fetch_sqes(struct pci_epf_nvme *epf_nvme, int qid)
@@ -1268,7 +1305,7 @@ invalid_offset:
 	return -EINVAL;
 }
 
-static void pci_epf_nvme_unmap_cq(struct pci_epf_nvme *epf_nvme, int qid)
+static void pci_epf_nvme_clean_cq(struct pci_epf_nvme *epf_nvme, int qid)
 {
 	struct pci_epf_nvme_queue *cq = &epf_nvme->ctrl.cq[qid];
 
@@ -1279,13 +1316,16 @@ static void pci_epf_nvme_unmap_cq(struct pci_epf_nvme *epf_nvme, int qid)
 	if (cq->ref)
 		return;
 
-	pci_epf_mem_unmap(epf_nvme->epf, &cq->map);
+	if (cq->mapped)
+		pci_epf_mem_unmap(epf_nvme->epf, &cq->map);
+	if (cq->local_queue) /* Should not be allocated */
+		kfree(cq->local_queue);
 	memset(cq, 0, sizeof(*cq));
 }
 
-static int pci_epf_nvme_map_cq(struct pci_epf_nvme *epf_nvme, int qid,
-			       int flags, int size, int vector,
-			       phys_addr_t pci_addr)
+static int pci_epf_nvme_init_cq(struct pci_epf_nvme *epf_nvme, int qid,
+				int flags, int size, int vector,
+				phys_addr_t pci_addr)
 {
 	struct pci_epf_nvme_ctrl *ctrl = &epf_nvme->ctrl;
 	struct pci_epf_nvme_queue *cq = &ctrl->cq[qid];
@@ -1317,18 +1357,20 @@ static int pci_epf_nvme_map_cq(struct pci_epf_nvme *epf_nvme, int qid,
 		cq->qes = ctrl->io_cqes;
 	qsize = cq->qes * cq->depth;
 
-	ret = pci_epf_mem_map(epf, pci_addr, qsize, &cq->map);
-	if (ret != qsize) {
-		if (ret > 0) {
-			pci_epf_mem_unmap(epf, &cq->map);
-			dev_err(&epf->dev, "Partial CQ %d mapping\n", qid);
-			ret = -ENOMEM;
-		} else {
-			dev_err(&epf->dev, "Map CQ %d failed\n", qid);
-		}
+	cq->pci_addr = pci_addr;
+	cq->mapped = false;
+
+	/* Try to map, to detect unmappable (partially mappable) queues */
+	ret = pci_epf_nvme_map_cq(epf_nvme, qid);
+	if (ret) {
 		memset(cq, 0, sizeof(*cq));
 		return ret;
 	}
+	pci_epf_nvme_unmap_cq(epf_nvme, qid);
+
+	/* Only submission queues use the local queue */
+	cq->local_queue = NULL;
+	cq->local_tail = 0;
 
 	dev_dbg(&epf->dev,
 		"CQ %d: PCI addr 0x%llx, virt addr 0x%llx, size %zu B\n",
@@ -1685,7 +1727,7 @@ static void pci_epf_nvme_disable_ctrl(struct pci_epf_nvme *epf_nvme,
 		pci_epf_nvme_clean_sq(epf_nvme, qid);
 
 	for (qid = ctrl->nr_queues - 1; qid >= 0; qid--)
-		pci_epf_nvme_unmap_cq(epf_nvme, qid);
+		pci_epf_nvme_clean_cq(epf_nvme, qid);
 
 	if (shutdown) {
 		pci_epf_nvme_delete_ctrl(epf);
@@ -1738,10 +1780,10 @@ static void pci_epf_nvme_enable_ctrl(struct pci_epf_nvme *epf_nvme)
 	 * target admin queues were already created when the target was
 	 * enabled.
 	 */
-	ret = pci_epf_nvme_map_cq(epf_nvme, 0,
-				  NVME_QUEUE_PHYS_CONTIG | NVME_CQ_IRQ_ENABLED,
-				  (ctrl->aqa & 0x0fff0000) >> 16, 0,
-				  ctrl->acq & GENMASK(63, 12));
+	ret = pci_epf_nvme_init_cq(epf_nvme, 0,
+				   NVME_QUEUE_PHYS_CONTIG | NVME_CQ_IRQ_ENABLED,
+				   (ctrl->aqa & 0x0fff0000) >> 16, 0,
+				   ctrl->acq & GENMASK(63, 12));
 	if (ret)
 		return;
 
@@ -1749,7 +1791,7 @@ static void pci_epf_nvme_enable_ctrl(struct pci_epf_nvme *epf_nvme)
 				   ctrl->aqa & 0x0fff,
 				   ctrl->asq & GENMASK(63, 12));
 	if (ret) {
-		pci_epf_nvme_unmap_cq(epf_nvme, 0);
+		pci_epf_nvme_clean_cq(epf_nvme, 0);
 		return;
 	}
 
@@ -1773,8 +1815,10 @@ static void pci_epf_nvme_enable_ctrl(struct pci_epf_nvme *epf_nvme)
 		goto disable;
 	}
 
+	/* One window is used by SQ poll thread, one by CQ thread, and each
+	 * xfer thread requires its own window */
 	effective_xfer_threads = min_t(int, num_xfer_threads,
-			epf->epc->num_windows - (epf_nvme->ctrl.nr_queues + 1));
+			epf->epc->num_windows - 2);
 
 	if (effective_xfer_threads < 1) {
 		dev_err(&epf_nvme->epf->dev, "Cannot init transfer threads\n");
@@ -1959,8 +2003,8 @@ static void pci_epf_nvme_admin_create_cq(struct pci_epf_nvme *epf_nvme,
 		return;
 	}
 
-	ret = pci_epf_nvme_map_cq(epf_nvme, cqid, cq_flags, qsize, vector,
-				  le64_to_cpu(cmd->create_cq.prp1));
+	ret = pci_epf_nvme_init_cq(epf_nvme, cqid, cq_flags, qsize, vector,
+				   le64_to_cpu(cmd->create_cq.prp1));
 	if (ret) {
 		dev_warn(&epf_nvme->epf->dev,
 			 "Cannot map CQ\n");
@@ -2348,26 +2392,15 @@ static int pci_epf_nvme_alloc_reg_bar(struct pci_epf *epf)
 	int ret;
 
 	/*
-	 * We want one MSI or MSIX per queue and are we want to keep queue
-	 * pairs mapped. So we are also limited by the number of memory windows
-	 * we have. Set our maximum number of queues based on these limits.
+	 * Max number of queues is not limited by MSI(X) interrupt numbers.
 	 *
-	 * CQs are permanently mapped, one window per CQ
-	 * SQs are mapped dynamically and one window is used by sq_poll
-	 * xfer threads use a window each, at least one is required
+	 * CQs are mapped dynamically, one window is used by CQ thread
+	 * SQs are mapped dynamically and one window is used by sq_poll thread
+	 * xfer threads use a window each, at least one is xfer thread required.
 	 *
-	 * Therefore max number of (CQ) queues is the number of windows minus
-	 * one for sq_poll dynamic SQ mapping and at least one for xfer thread
+	 * The number of queues is not limited by the windows
 	 */
-	epf_nvme->max_nr_queues = (epf->epc->num_windows - 2);
-	if (features->msix_capable)
-		epf_nvme->max_nr_queues =
-			min_t(unsigned int, epf->msix_interrupts,
-			      epf_nvme->max_nr_queues);
-	if (features->msi_capable)
-		epf_nvme->max_nr_queues =
-			min_t(unsigned int, epf->msi_interrupts,
-			      epf_nvme->max_nr_queues);
+	epf_nvme->max_nr_queues = PCI_EPF_NVME_MAX_IO_QUEUES;
 
 	dev_info(&epf->dev, "Maximum number of queues: %u\n",
 		 epf_nvme->max_nr_queues);
