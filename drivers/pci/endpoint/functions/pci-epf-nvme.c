@@ -42,6 +42,10 @@
  * Maximum number of IO queues supported
  */
 #define PCI_EPF_NVME_MAX_IO_QUEUES 32
+/*
+ * Maximum number of queues Admin queue included
+ */
+#define PCI_EPF_NVME_MAX_QUEUES (PCI_EPF_NVME_MAX_IO_QUEUES + 1)
 
 /*
  * Maximum data transfer size: limit to 128 KB to avoid excessive local
@@ -1559,7 +1563,7 @@ static int pci_epf_nvme_create_ctrl(struct pci_epf *epf)
 	ctrl->nr_queues = nctrl->queue_count;
 	if (ctrl->nr_queues > epf_nvme->max_nr_queues) {
 		/* Admin queue takes one slot, therefore -1 */
-		dev_err(dev, "Too many queues (maximum allowed: %u)\n",
+		dev_err(dev, "Too many IO queues (maximum allowed: %u)\n",
 			epf_nvme->max_nr_queues - 1);
 		ret = -EINVAL;
 		goto out_delete_ctrl;
@@ -2122,7 +2126,17 @@ static void pci_epf_nvme_process_admin_cmd(struct pci_epf_nvme_cmd *epcmd)
 
 	case nvme_admin_get_features:
 		/* XXX TODO XXX */
+		/* Fallthrough */
 	case nvme_admin_set_features:
+		/* Here the result is only for IO queues, and is 0 based,
+		 * therefore ctrl number of queues -1 (admin) -1 ( 0 based)
+		 * We are allowed to return a number of queues different than
+		 * what the host wants to set (smaller or bigger) */
+		if ((cmd->features.fid & 0xff) == NVME_FEAT_NUM_QUEUES) {
+			epcmd->cqe.result.u32 =
+				(epf_nvme->ctrl.nr_queues - 2) << 16 |
+				(epf_nvme->ctrl.nr_queues - 2);
+		}
 	case nvme_admin_abort_cmd:
 		break;
 
@@ -2400,7 +2414,7 @@ static int pci_epf_nvme_alloc_reg_bar(struct pci_epf *epf)
 	 *
 	 * The number of queues is not limited by the windows
 	 */
-	epf_nvme->max_nr_queues = PCI_EPF_NVME_MAX_IO_QUEUES;
+	epf_nvme->max_nr_queues = PCI_EPF_NVME_MAX_QUEUES;
 
 	dev_info(&epf->dev, "Maximum number of queues: %u\n",
 		 epf_nvme->max_nr_queues);
