@@ -1895,12 +1895,6 @@ static int pci_epf_nvme_submit_cmd_nowait(struct pci_epf_nvme *epf_nvme,
 	else
 		q = epf_nvme->ctrl.ctrl->admin_q;
 
-	/**
-	 * @todo timeout ?
-	 * @note code inspired by __nvme_submit_sync_cmd() in drivers/nvme/host/core.c
-	 * and nvmet_passthru_execute_cmd() in drivers/nvme/target/passthru.c
-	 */
-
 	req = blk_mq_alloc_request(q, nvme_req_op(cmd), 0);
 
 	if (IS_ERR(req)) {
@@ -1914,9 +1908,6 @@ static int pci_epf_nvme_submit_cmd_nowait(struct pci_epf_nvme *epf_nvme,
 		if (ret)
 			goto err_free;
 	}
-
-//	if (timeout)
-//		req->timeout = timeout;
 
 	req->end_io = pci_epf_nvme_backend_cmd_done_cb;
 	req->end_io_data = epcmd;
