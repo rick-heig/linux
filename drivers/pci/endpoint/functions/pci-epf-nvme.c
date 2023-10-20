@@ -66,6 +66,10 @@ static int num_xfer_threads = 1;
 DECLARE_WAIT_QUEUE_HEAD(xfer_wq);
 DECLARE_WAIT_QUEUE_HEAD(cq_wq);
 
+static bool do_readwrite = true;
+static bool do_transfer = true;
+static bool do_backend = true;
+
 #define MAX_PATH_LEN	8
 
 enum destination {
@@ -795,19 +799,21 @@ static int pci_epf_nvme_xfer_thread_fn(void *arg)
 			continue;
 		}
 
-		epcmd->xfer_thread = xfer_thread;
+		if (do_transfer) {
+			epcmd->xfer_thread = xfer_thread;
 
-		/* Get the host buffer segments */
-		ret = pci_epf_nvme_cmd_parse_dptr(epcmd);
-		if (ret) {
-			pci_epf_nvme_send_cmd_to_completion(epcmd);
-			continue;
-		}
+			/* Get the host buffer segments */
+			ret = pci_epf_nvme_cmd_parse_dptr(epcmd);
+			if (ret) {
+				pci_epf_nvme_send_cmd_to_completion(epcmd);
+				continue;
+			}
 
-		ret = pci_epf_nvme_cmd_transfer(epcmd);
-		if (ret) {
-			pci_epf_nvme_send_cmd_to_completion(epcmd);
-			continue;
+			ret = pci_epf_nvme_cmd_transfer(epcmd);
+			if (ret) {
+				pci_epf_nvme_send_cmd_to_completion(epcmd);
+				continue;
+			}
 		}
 
 		pci_epf_nvme_send_cmd_to_next(epcmd);
@@ -1978,9 +1984,16 @@ static inline
 void pci_epf_nvme_send_cmd_to_backend(struct pci_epf_nvme_cmd *epcmd)
 {
 	int ret;
-	ret = pci_epf_nvme_submit_cmd_nowait(epcmd->epf_nvme, epcmd);
-	if (ret)
+	/* Always send admin commands, and non read/write commands */
+	if (do_backend || epcmd->sqid == 0 ||
+	    (epcmd->cmd.common.opcode != nvme_cmd_read &&
+	     epcmd->cmd.common.opcode != nvme_cmd_write)) {
+		ret = pci_epf_nvme_submit_cmd_nowait(epcmd->epf_nvme, epcmd);
+		if (ret)
+			pci_epf_nvme_send_cmd_to_completion(epcmd);
+	} else {
 		pci_epf_nvme_send_cmd_to_completion(epcmd);
+	}
 }
 
 static inline void pci_epf_nvme_send_cmd_to_xfer(
@@ -2234,12 +2247,20 @@ void pci_epf_nvme_process_io_cmd(struct pci_epf_nvme_cmd *epcmd)
 
 	switch (cmd->common.opcode) {
 	case nvme_cmd_read:
+		if (!do_readwrite) {
+			pci_epf_nvme_send_cmd_to_completion(epcmd);
+			return;
+		}
 		epcmd->transfer_len = pci_epf_nvme_rw_data_len(epcmd);
 		pci_epf_nvme_set_bxc_path(epcmd);
 		epcmd->dir = DMA_TO_DEVICE;
 		break;
 
 	case nvme_cmd_write:
+		if (!do_readwrite) {
+			pci_epf_nvme_send_cmd_to_completion(epcmd);
+			return;
+		}
 		epcmd->transfer_len = pci_epf_nvme_rw_data_len(epcmd);
 		pci_epf_nvme_set_xbc_path(epcmd);
 		epcmd->dir = DMA_FROM_DEVICE;
@@ -2916,12 +2937,72 @@ static ssize_t pci_epf_nvme_completion_fifo_show(struct config_item *item,
 }
 CONFIGFS_ATTR_RO(pci_epf_nvme_, completion_fifo);
 
+static ssize_t pci_epf_nvme_do_readwrite_show(struct config_item *item,
+					      char *page)
+{
+	return sysfs_emit(page, "%d\n", do_readwrite);
+}
+
+static ssize_t pci_epf_nvme_do_readwrite_store(struct config_item *item,
+					       const char *page, size_t len)
+{
+	int ret;
+	ret = kstrtobool(page, &do_readwrite);
+	if (ret)
+		return ret;
+
+	return len;
+}
+
+CONFIGFS_ATTR(pci_epf_nvme_, do_readwrite);
+
+static ssize_t pci_epf_nvme_do_transfer_show(struct config_item *item,
+					     char *page)
+{
+	return sysfs_emit(page, "%d\n", do_transfer);
+}
+
+static ssize_t pci_epf_nvme_do_transfer_store(struct config_item *item,
+					      const char *page, size_t len)
+{
+	int ret;
+	ret = kstrtobool(page, &do_transfer);
+	if (ret)
+		return ret;
+
+	return len;
+}
+
+CONFIGFS_ATTR(pci_epf_nvme_, do_transfer);
+
+static ssize_t pci_epf_nvme_do_backend_show(struct config_item *item,
+					    char *page)
+{
+	return sysfs_emit(page, "%d\n", do_backend);
+}
+
+static ssize_t pci_epf_nvme_do_backend_store(struct config_item *item,
+					     const char *page, size_t len)
+{
+	int ret;
+	ret = kstrtobool(page, &do_backend);
+	if (ret)
+		return ret;
+
+	return len;
+}
+
+CONFIGFS_ATTR(pci_epf_nvme_, do_backend);
+
 static struct configfs_attribute *pci_epf_nvme_attrs[] = {
 	&pci_epf_nvme_attr_ctrl_opts,
 	&pci_epf_nvme_attr_dma_enable,
 	&pci_epf_nvme_attr_num_xfer_threads,
 	&pci_epf_nvme_attr_xfer_fifo,
 	&pci_epf_nvme_attr_completion_fifo,
+	&pci_epf_nvme_attr_do_readwrite,
+	&pci_epf_nvme_attr_do_transfer,
+	&pci_epf_nvme_attr_do_backend,
 	NULL,
 };
 
