@@ -605,7 +605,7 @@ static int pci_epf_nvme_alloc_cmd_buffer(struct pci_epf_nvme_cmd *epcmd)
 {
 	void *buffer;
 
-	buffer = kvzalloc(epcmd->transfer_len, GFP_KERNEL);
+	buffer = kvmalloc(epcmd->transfer_len, GFP_KERNEL);
 	if (!buffer)
 		return -ENOMEM;
 
