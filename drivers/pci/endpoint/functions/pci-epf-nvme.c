@@ -48,6 +48,11 @@
 #define PCI_EPF_NVME_MAX_QUEUES (PCI_EPF_NVME_MAX_IO_QUEUES + 1)
 
 /*
+ *
+ */
+#define PCI_EPF_NVME_MIN_POLL_DELAY_US 50
+
+/*
  * Maximum data transfer size: limit to 128 KB to avoid excessive local
  * memory use for buffers.
  */
@@ -69,6 +74,9 @@ DECLARE_WAIT_QUEUE_HEAD(cq_wq);
 static bool do_readwrite = true;
 static bool do_transfer = true;
 static bool do_backend = true;
+static unsigned relaxed_poll_threshold = 100;
+static unsigned poll_delay_usecs = PCI_EPF_NVME_MIN_POLL_DELAY_US;
+static unsigned poll_relaxed_delay_usecs = PCI_EPF_NVME_MIN_POLL_DELAY_US * 100;
 
 #define MAX_PATH_LEN	8
 
@@ -2309,16 +2317,25 @@ static bool pci_epf_nvme_process_cmds(struct pci_epf_nvme *epf_nvme, int qid)
 	struct pci_epf_nvme_queue *sq = &ctrl->sq[qid];
 	struct pci_epf_nvme_cmd *epcmd;
 	int num_cmds = pci_epf_nvme_fetch_sqes(epf_nvme, qid);
+	int in_flight_cmds;
 
 	if (!num_cmds)
-		return false; /* No work to do */
+		return false; /* Queue is inactive */
+
+	in_flight_cmds = atomic_read(&epf_nvme->in_flight_commands);
+	if (num_cmds + in_flight_cmds > PCI_EPF_NVME_FIFO_SIZE) {
+		return false; /* Wait for space in controller */
+	}
 
 	/* While there are commands in the local queue, proccess them */
 	while (sq->head != sq->local_tail) {
 		do {
 			epcmd = pci_epf_nvme_alloc_cmd(epf_nvme);
-			if (!epcmd) /* No space in cache, retry later */
+			if (!epcmd) { /* No space in cache, retry later */
+				dev_warn_once(&epf_nvme->epf->dev,
+					      "Alloc wait...\n");
 				usleep_range(10, 100);
+			}
 		} while (!epcmd);
 		pci_epf_nvme_init_cmd(epf_nvme, epcmd, sq->qid, sq->cqid);
 		memcpy(&epcmd->cmd, &sq->local_queue[sq->head],
@@ -2332,7 +2349,7 @@ static bool pci_epf_nvme_process_cmds(struct pci_epf_nvme *epf_nvme, int qid)
 			pci_epf_nvme_process_admin_cmd(epcmd);
 	}
 
-	return sq->head != sq->tail; /* Work left to do */
+	return true; /* Queue is active */
 }
 
 static void pci_epf_nvme_sq_poll(struct work_struct *work)
@@ -2340,26 +2357,33 @@ static void pci_epf_nvme_sq_poll(struct work_struct *work)
 	struct pci_epf_nvme *epf_nvme =
 		container_of(work, struct pci_epf_nvme, sq_poll.work);
 	struct pci_epf_nvme_ctrl *ctrl = &epf_nvme->ctrl;
-	bool work_to_do = true;
-	int qid, val;
+	bool active_queues = true;
+	int qid, in_flight_cmds;
 
 	/* Process pending commands, starting with the IO queues */
-	while (work_to_do && pci_epf_nvme_ctrl_ready(ctrl)) {
-		work_to_do = false;
-		for (qid = 0; qid < ctrl->nr_queues; qid++)
-			work_to_do |= pci_epf_nvme_process_cmds(epf_nvme, qid);
+	while (active_queues && pci_epf_nvme_ctrl_ready(ctrl)) {
+		active_queues = false;
+		for (qid = 0; qid < ctrl->nr_queues; qid++) {
+			active_queues |= pci_epf_nvme_process_cmds(epf_nvme, qid);
+		}
 	}
 
 	if (!pci_epf_nvme_ctrl_ready(ctrl))
 		return;
 
-	val = atomic_read(&epf_nvme->in_flight_commands);
-	if (val > 10)
-		/* Relaxed polling, we have enough work for a while */
-		queue_delayed_work(epf_nvme_sq_wq, &epf_nvme->sq_poll,
-				   msecs_to_jiffies(2));
-	else
-		queue_delayed_work(epf_nvme_sq_wq, &epf_nvme->sq_poll, 1);
+	in_flight_cmds = atomic_read(&epf_nvme->in_flight_commands);
+	if (in_flight_cmds > relaxed_poll_threshold)
+		/* The controller has a lot of work already, wait a bit more */
+		usleep_range(PCI_EPF_NVME_MIN_POLL_DELAY_US,
+			     poll_relaxed_delay_usecs);
+	else {
+		/* The controller is not busy, poll often */
+		usleep_range(PCI_EPF_NVME_MIN_POLL_DELAY_US, poll_delay_usecs);
+	}
+	/* We wait above and don't use jiffy parameter below because one jiffy
+	   can actually be 10ms if HZ = 100 so sleep few us above and queue
+	   directly, 10ms polling is way to slow */
+	queue_delayed_work(epf_nvme_sq_wq, &epf_nvme->sq_poll, 0);
 }
 
 static void pci_epf_nvme_reg_poll(struct work_struct *work)
@@ -2994,6 +3018,89 @@ static ssize_t pci_epf_nvme_do_backend_store(struct config_item *item,
 
 CONFIGFS_ATTR(pci_epf_nvme_, do_backend);
 
+static ssize_t pci_epf_nvme_relaxed_poll_threshold_show(struct config_item *item,
+							char *page)
+{
+	return sysfs_emit(page, "%u\n", relaxed_poll_threshold);
+}
+
+static ssize_t pci_epf_nvme_relaxed_poll_threshold_store(struct config_item *item,
+						   const char *page, size_t len)
+{
+	int ret;
+
+	ret = kstrtouint(page, 10, &relaxed_poll_threshold);
+	if (ret)
+		return ret;
+
+	if (relaxed_poll_threshold > PCI_EPF_NVME_FIFO_SIZE) {
+		relaxed_poll_threshold = PCI_EPF_NVME_FIFO_SIZE;
+		return -EINVAL;
+	}
+
+	return len;
+}
+
+CONFIGFS_ATTR(pci_epf_nvme_, relaxed_poll_threshold);
+
+static ssize_t pci_epf_nvme_poll_delay_usecs_show(struct config_item *item,
+						  char *page)
+{
+	return sysfs_emit(page, "%u\n", poll_delay_usecs);
+}
+
+static ssize_t pci_epf_nvme_poll_delay_usecs_store(struct config_item *item,
+						   const char *page, size_t len)
+{
+	int ret;
+
+	ret = kstrtouint(page, 10, &poll_delay_usecs);
+	if (ret)
+		return ret;
+
+	if (poll_delay_usecs > 100000) {
+		poll_delay_usecs = 100000;
+		return -EINVAL;
+	}
+	if (poll_delay_usecs < PCI_EPF_NVME_MIN_POLL_DELAY_US) {
+		poll_delay_usecs = PCI_EPF_NVME_MIN_POLL_DELAY_US;
+		return -EINVAL;
+	}
+
+	return len;
+}
+
+CONFIGFS_ATTR(pci_epf_nvme_, poll_delay_usecs);
+
+static ssize_t pci_epf_nvme_poll_relaxed_delay_usecs_show(struct config_item *item,
+						  char *page)
+{
+	return sysfs_emit(page, "%u\n", poll_relaxed_delay_usecs);
+}
+
+static ssize_t pci_epf_nvme_poll_relaxed_delay_usecs_store(struct config_item *item,
+						   const char *page, size_t len)
+{
+	int ret;
+
+	ret = kstrtouint(page, 10, &poll_relaxed_delay_usecs);
+	if (ret)
+		return ret;
+
+	if (poll_relaxed_delay_usecs > 1000000) {
+		poll_relaxed_delay_usecs = 1000000;
+		return -EINVAL;
+	}
+	if (poll_relaxed_delay_usecs < PCI_EPF_NVME_MIN_POLL_DELAY_US) {
+		poll_delay_usecs = PCI_EPF_NVME_MIN_POLL_DELAY_US;
+		return -EINVAL;
+	}
+
+	return len;
+}
+
+CONFIGFS_ATTR(pci_epf_nvme_, poll_relaxed_delay_usecs);
+
 static struct configfs_attribute *pci_epf_nvme_attrs[] = {
 	&pci_epf_nvme_attr_ctrl_opts,
 	&pci_epf_nvme_attr_dma_enable,
@@ -3003,6 +3110,9 @@ static struct configfs_attribute *pci_epf_nvme_attrs[] = {
 	&pci_epf_nvme_attr_do_readwrite,
 	&pci_epf_nvme_attr_do_transfer,
 	&pci_epf_nvme_attr_do_backend,
+	&pci_epf_nvme_attr_relaxed_poll_threshold,
+	&pci_epf_nvme_attr_poll_delay_usecs,
+	&pci_epf_nvme_attr_poll_relaxed_delay_usecs,
 	NULL,
 };
 
