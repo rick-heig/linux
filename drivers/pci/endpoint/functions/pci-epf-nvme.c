@@ -34,9 +34,9 @@
 #define PCI_EPF_NVME_CQ_FULL_DELAY_US 10
 
 /*
- * Size of the FIFOs used in driver
+ * Size of the FIFOs used in driver, should be bigger than MQES
  */
-#define PCI_EPF_NVME_FIFO_SIZE 1024
+#define PCI_EPF_NVME_FIFO_SIZE 2048
 
 /*
  * Maximum number of IO queues supported
@@ -787,7 +787,7 @@ static int pci_epf_nvme_xfer_thread_fn(void *arg)
 		while (kfifo_is_empty(&epf_nvme->xfer_fifo) &&
 		       !epf_nvme->disabled) {
 			spin_unlock(&epf_nvme->xfer_fifo_rd_lock);
-			wait_event_interruptible(xfer_wq,
+			ret = wait_event_interruptible(xfer_wq,
 				!kfifo_is_empty(&epf_nvme->xfer_fifo) ||
 				epf_nvme->disabled);
 			spin_lock(&epf_nvme->xfer_fifo_rd_lock);
@@ -797,13 +797,14 @@ static int pci_epf_nvme_xfer_thread_fn(void *arg)
 			spin_unlock(&epf_nvme->xfer_fifo_rd_lock);
 			return 0;
 		}
+		if (ret) continue; /* signal */
 
 		ret = kfifo_get(&epf_nvme->xfer_fifo, &epcmd);
 		spin_unlock(&epf_nvme->xfer_fifo_rd_lock);
 
 		if (ret != 1) {
 			dev_err(&epf_nvme->epf->dev,
-			        "Could not get element from completion FIFO\n");
+			        "Could not get element from transfer FIFO\n");
 			continue;
 		}
 
@@ -1030,11 +1031,13 @@ static int pci_epf_nvme_completion_thread_fn(void *arg)
 	struct pci_epf_nvme_cmd *epcmd;
 
 	while(1) {
-		wait_event_interruptible(cq_wq,
+		ret = wait_event_interruptible(cq_wq,
 			!kfifo_is_empty(&epf_nvme->completion_fifo) ||
 			epf_nvme->disabled);
 		if (epf_nvme->disabled)
 			return 0;
+
+		if (ret) continue; /* signal */
 
 		ret = kfifo_get(&epf_nvme->completion_fifo, &epcmd);
 		if (ret != 1) {
