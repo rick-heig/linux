@@ -29,10 +29,18 @@
 
 #define XILINX_PCIE_EP_AXI_ADDRESS_TRANSLATION_REGS_OFFSET 0x208
 
+#define XILINX_PCIE_EP_MSI_X_TABLE_OFFSET	0x8000
+#define XILINX_PCIE_EP_MSI_X_PBA_OFFSET		0x8fe0
+
 struct xilinx_pcie {
 	void	__iomem		*reg_base;	/* DT ctrl */
 	void	__iomem		*hdr_conf;	/* DT hdr-conf */
-	void	__iomem		*irq_reg;	/* irq-reg */
+	void	__iomem		*irq_reg;	/* DT irq-reg */
+	void	__iomem		*msix_addr_reg; /* DT */
+	void	__iomem		*msix_data_reg; /* DT */
+	size_t			msix_table_offset; /* In BAR0 */
+	size_t			msix_pba_offset;
+	struct	pci_epf_bar	*bar_0;
 	struct	device		*dev;
 	struct 	resource	*mem_res;	/* DT windows */
 	u32			num_windows;
@@ -45,34 +53,24 @@ struct xilinx_pcie_ep {
 	u32			max_regions;
 	unsigned long		ob_region_map;
 	phys_addr_t		*ob_addr;
-	phys_addr_t		irq_phys_addr;
-	void __iomem		*irq_cpu_addr; /* here to write the MSI IRQ ? */
-	u64			irq_pci_addr;
-	u8			irq_pci_fn;
-	u8			irq_pending;
 };
 
 static struct pci_epc_features xilinx_pcie_epc_features = {
 	.msi_capable = true,
 	/* Reserved BARs */
+	.msix_capable = true,
 	.reserved_bar = GENMASK(5, 3),
 	/* Fixed BARs - All are fixed */
 	.fixed_bar = GENMASK(5, 0),
+	/* Only BAR0 and BAR2 are available, both are 64-bit */
+	.bar_fixed_64bit = BIT(2) | BIT(0),
 	/* Fixed sizes */ /** @todo get from DT */
 	.bar_fixed_size = {
 		SZ_128K,
-		SZ_4K,
+		0,
 		SZ_16M,
 	},
 	//.align = XILINX_PCIE_AT_SIZE_ALIGN, /** @todo get from DT */
-#if 0
-	/* BARs with fixed address translations */ /** @todo get from DT */
-	.bar_fixed_addr = {
-		0x480000000ULL,
-		0x480020000ULL,
-		0x481000000ULL,
-	},
-#endif
 };
 
 static int xilinx_pcie_ep_write_header(struct pci_epc *epc, u8 fn, u8 vfn,
@@ -102,8 +100,8 @@ static int xilinx_pcie_ep_write_header(struct pci_epc *epc, u8 fn, u8 vfn,
 static int xilinx_pcie_ep_get_fixed_bar(struct pci_epc *epc, u8 fn, u8 vfn,
 					struct pci_epf_bar *epf_bar)
 {
-	//struct xilinx_pcie_ep *ep = epc_get_drvdata(epc);
-	//struct xilinx_pcie *xilinx = &ep->xilinx;
+	struct xilinx_pcie_ep *ep = epc_get_drvdata(epc);
+	struct xilinx_pcie *xilinx = &ep->xilinx;
 
 	/// @todo implement this, get info from device tree, because it is fixed
 
@@ -112,29 +110,31 @@ static int xilinx_pcie_ep_get_fixed_bar(struct pci_epc *epc, u8 fn, u8 vfn,
 
 	switch (epf_bar->barno) {
 	case BAR_0:
+		/* Get BAR0, which we need for MSI-X */
+		xilinx->bar_0 = epf_bar;
+		if (!(epf_bar->flags & PCI_BASE_ADDRESS_MEM_TYPE_64))
+			dev_warn(&epc->dev, "BAR0 is not set to 64-bit !\n");
 		/* This is fixed */ /** @todo get from DT */
 		epf_bar->phys_addr = 0x470000000ULL;
 		break;
-	case BAR_1:
-		/* This is fixed */ /** @todo get from DT */
-		epf_bar->phys_addr = 0x480020000ULL;
-		break;
 	case BAR_2:
+		if (!(epf_bar->flags & PCI_BASE_ADDRESS_MEM_TYPE_64))
+			dev_warn(&epc->dev, "BAR2 is not set to 64-bit !\n");
 		/* This is fixed */ /** @todo get from DT */
-		epf_bar->phys_addr = 0x481000000ULL;
+		epf_bar->phys_addr = 0x480000000ULL;
 		break;
 	default: return -EINVAL;
 	}
 
 	/* This is fixed */
 	epf_bar->size = xilinx_pcie_epc_features.bar_fixed_size[epf_bar->barno];
-	/* Here we explicitely cast to a void* and drop the __iomem qualifier
-	 * this is to be compatible with the current API, but actually it's
-	 * still iomem and should be used at such, e.g., unaligned 64-bit access
-	 * isn't possible */
-	epf_bar->addr = (void *)ioremap(epf_bar->phys_addr, epf_bar->size);
+
+	epf_bar->addr = memremap(epf_bar->phys_addr, epf_bar->size, MEMREMAP_WC);
+	if (!epf_bar->addr)
+		return -ENOMEM;
+
 	/* This is fixed */
-	epf_bar->flags = PCI_BASE_ADDRESS_MEM_TYPE_32 |
+	epf_bar->flags = PCI_BASE_ADDRESS_MEM_TYPE_64 |
 			 PCI_BASE_ADDRESS_SPACE_MEMORY;
 
 	return 0;
@@ -232,6 +232,31 @@ static int xilinx_pcie_ep_get_msi(struct pci_epc *epc, u8 func_no, u8 vfunc_no)
 	return 1;
 }
 
+static int xilinx_pcie_ep_set_msix(struct pci_epc *epc, u8 func_no, u8 vfunc_no,
+				   u16 interrupts, enum pci_barno, u32 offset)
+{
+	/** @note The number of MSI-X IRQs is fixed in the IP ... */
+	if (interrupts > 33)
+		return -EINVAL;
+
+	return 0;
+}
+
+static int xilinx_pcie_ep_get_msix(struct pci_epc *epc, u8 func_no, u8 vfunc_no)
+{
+	struct xilinx_pcie_ep *ep = epc_get_drvdata(epc);
+
+	if (!ep->xilinx.bar_0 ||
+	    !ep->xilinx.msix_addr_reg || !ep->xilinx.msix_data_reg) {
+		dev_warn(&epc->dev, "Xilinx get msix return -ENODEV\n");
+		return -ENODEV;
+	}
+
+	/** @note The number of MSI-X IRQs is fixed in the IP ... */
+	return 33; /* We don't know how many the host has allocated ... */
+	/* @todo we could check the values in the MSI table actually */
+}
+
 static int xilinx_pcie_ep_send_irq(struct xilinx_pcie_ep *ep, u8 fn,
 				   u8 intx)
 {
@@ -240,6 +265,82 @@ static int xilinx_pcie_ep_send_irq(struct xilinx_pcie_ep *ep, u8 fn,
 	writel(1, xilinx->irq_reg);
 	udelay(1);
 	writel(0, xilinx->irq_reg);
+	return 0;
+}
+
+/*
+ * Read a 32-bits BAR 0 register (equivalent to readl()).
+ */
+static inline u32 pci_ep_bar_0_reg_read32(struct xilinx_pcie_ep *ep,
+					  u32 reg)
+{
+	volatile __le32 *ctrl_reg = ep->xilinx.bar_0->addr + reg;
+
+	return le32_to_cpu(*ctrl_reg);
+}
+
+/*
+ * Write a 32-bits BAR 0 register (equivalent to readl()).
+ */
+static inline void pci_ep_bar_0_reg_write32(struct xilinx_pcie_ep *ep,
+					    u32 reg, u32 val)
+{
+	volatile __le32 *ctrl_reg = ep->xilinx.bar_0->addr + reg;
+
+	*ctrl_reg = cpu_to_le32(val);
+}
+
+static int xilinx_pcie_ep_send_msix(struct xilinx_pcie_ep *ep, u8 fn, u16 irq)
+{
+	u32 addr_hi, addr_lo, data;
+
+	if (fn || !irq || irq > 33)
+		return -EINVAL;
+
+	if (!ep->xilinx.bar_0 ||
+	    !ep->xilinx.msix_addr_reg || !ep->xilinx.msix_data_reg)
+		return -ENODEV;
+
+	/* Get address from MSI-X table */
+	addr_lo = pci_ep_bar_0_reg_read32(
+		ep, XILINX_PCIE_EP_MSI_X_TABLE_OFFSET +
+		    (irq - 1) * PCI_MSIX_ENTRY_SIZE + PCI_MSIX_ENTRY_LOWER_ADDR);
+	addr_hi = pci_ep_bar_0_reg_read32(
+		ep, XILINX_PCIE_EP_MSI_X_TABLE_OFFSET +
+		    (irq - 1) * PCI_MSIX_ENTRY_SIZE + PCI_MSIX_ENTRY_UPPER_ADDR);
+
+	/* Get data from MSI-X table */
+	data = pci_ep_bar_0_reg_read32(
+		ep, XILINX_PCIE_EP_MSI_X_TABLE_OFFSET +
+		    (irq - 1) * PCI_MSIX_ENTRY_SIZE + PCI_MSIX_ENTRY_DATA);
+
+	/* Check that it is not 0 */
+	if (!addr_lo && !addr_hi) {
+		dev_warn(&ep->epc->dev, "MSI-X address is NULL\n");
+		return -EINVAL;
+	}
+
+	/* Write address to registers */
+	writel(addr_lo, ep->xilinx.msix_addr_reg);
+	writel(addr_hi, ep->xilinx.msix_addr_reg + SZ_8);
+	/* Yes offset is 8 because Xilinx GPIO IP is used */
+
+	/* Write data to registers */
+	writel(data, ep->xilinx.msix_data_reg);
+
+	/* Set bit in PBA array (this should be atomic, but oh well...) */
+	data = pci_ep_bar_0_reg_read32(ep, XILINX_PCIE_EP_MSI_X_PBA_OFFSET);
+	data |= 1 << (irq - 1);
+	pci_ep_bar_0_reg_write32(ep, XILINX_PCIE_EP_MSI_X_PBA_OFFSET, data);
+
+	/* Write bit in register */
+	writel(0x10000, ep->xilinx.irq_reg);
+	udelay(1);
+	writel(0, ep->xilinx.irq_reg);
+
+	/* Check msix sent / fail, we can't do this by polling because these
+	 * signals only stay up for a single clock cycle (see PG194) */
+
 	return 0;
 }
 
@@ -270,9 +371,10 @@ static int xilinx_pcie_ep_raise_irq(struct pci_epc *epc, u8 fn, u8 vfn,
 	switch (type) {
 	case PCI_IRQ_LEGACY:
 		return xilinx_pcie_ep_send_irq(ep, fn, 0);
-	/* Do not support MSI / MSI-X for the moment */
 	case PCI_IRQ_MSI:
 		return xilinx_pcie_ep_send_irq(ep, fn, 0);
+	case PCI_IRQ_MSIX:
+		return xilinx_pcie_ep_send_msix(ep, fn, interrupt_num);
 	default:
 		return -EINVAL;
 	}
@@ -303,6 +405,8 @@ static const struct pci_epc_ops xilinx_pcie_epc_ops = {
 	/* Don't support MSI or MSI-X for the moment */
 	.set_msi	= xilinx_pcie_ep_set_msi,
 	.get_msi	= xilinx_pcie_ep_get_msi,
+	.set_msix	= xilinx_pcie_ep_set_msix,
+	.get_msix	= xilinx_pcie_ep_get_msix,
 	.raise_irq	= xilinx_pcie_ep_raise_irq,
 	.start		= xilinx_pcie_ep_start,
 	.get_features	= xilinx_pcie_ep_get_features,
@@ -345,6 +449,22 @@ static int xilinx_pcie_parse_ep_dt(struct xilinx_pcie *xilinx,
 	xilinx->irq_reg = devm_pci_remap_cfg_resource(dev, regs);
 	if (IS_ERR(xilinx->irq_reg))
 		return PTR_ERR(xilinx->irq_reg);
+
+	/* Get access to the register to set MSI-X addr */
+	regs = platform_get_resource_byname(pdev, IORESOURCE_MEM, "msix-addr-reg");
+	xilinx->msix_addr_reg = devm_pci_remap_cfg_resource(dev, regs);
+	if (IS_ERR(xilinx->msix_addr_reg)) {
+		dev_warn(dev, "Missing MSI-X address register\n");
+		xilinx->msix_addr_reg = NULL;
+	}
+
+	/* Get access to the register to set MSI-X addr */
+	regs = platform_get_resource_byname(pdev, IORESOURCE_MEM, "msix-data-reg");
+	xilinx->msix_data_reg = devm_pci_remap_cfg_resource(dev, regs);
+	if (IS_ERR(xilinx->msix_data_reg)) {
+		dev_warn(dev, "Missing MSI-X data register\n");
+		xilinx->msix_data_reg = NULL;
+	}
 
 	/* Get the window memory ressource */
 	xilinx->mem_res = platform_get_resource_byname(pdev, IORESOURCE_MEM,
@@ -437,46 +557,6 @@ static int xilinx_pcie_ep_probe(struct platform_device *pdev)
 		dev_err(dev, "failed to initialize the memory space\n");
 		return err;
 	}
-
-#if 0
-	ep->irq_cpu_addr = pci_epc_mem_alloc_addr(epc, &ep->irq_phys_addr,
-						  SZ_1M);
-	if (!ep->irq_cpu_addr) {
-		dev_err(dev, "failed to reserve memory space for MSI\n");
-		err = -ENOMEM;
-		goto err_epc_mem_exit;
-	}
-
-	ep->irq_pci_addr = ROCKCHIP_PCIE_EP_DUMMY_IRQ_ADDR;
-
-	/*
-	 * MSI-X is not supported but the controller still advertises the MSI-X
-	 * capability by default, which can lead to the Root Complex side
-	 * allocating MSI-X vectors which cannot be used. Avoid this by skipping
-	 * the MSI-X capability entry in the PCIe capabilities linked-list: get
-	 * the next pointer from the MSI-X entry and set that in the MSI
-	 * capability entry (which is the previous entry). This way the MSI-X
-	 * entry is skipped (left out of the linked-list) and not advertised.
-	 */
-	cfg_msi = rockchip_pcie_read(rockchip, PCIE_EP_CONFIG_BASE +
-				     ROCKCHIP_PCIE_EP_MSI_CTRL_REG);
-
-	cfg_msi &= ~ROCKCHIP_PCIE_EP_MSI_CP1_MASK;
-
-	cfg_msix_cp = rockchip_pcie_read(rockchip, PCIE_EP_CONFIG_BASE +
-					 ROCKCHIP_PCIE_EP_MSIX_CAP_REG) &
-					 ROCKCHIP_PCIE_EP_MSIX_CAP_CP_MASK;
-
-	cfg_msi |= cfg_msix_cp;
-
-	rockchip_pcie_write(rockchip, cfg_msi,
-			    PCIE_EP_CONFIG_BASE + ROCKCHIP_PCIE_EP_MSI_CTRL_REG);
-
-	rockchip_pcie_write(rockchip, PCIE_CLIENT_CONF_ENABLE,
-			    PCIE_CLIENT_CONFIG);
-#endif
-
-	/// @todo maybe config some MSI/MSI-X things ?
 
 	dev_info(dev, "Probe successful\n");
 
