@@ -2633,7 +2633,7 @@ static int pci_epf_nvme_init_irq(struct pci_epf *epf)
 	int ret;
 
 	/* Enable MSIX if supported, otherwise, use MSI */
-	if (epf_nvme->epc_features->msix_capable) {
+	if (epf_nvme->epc_features->msix_capable && epf->msix_interrupts) {
 		dev_info(&epf->dev, "MSIX capable, %d vectors\n",
 			 epf->msix_interrupts);
 		ret = pci_epf_set_msix(epf, epf->msix_interrupts,
