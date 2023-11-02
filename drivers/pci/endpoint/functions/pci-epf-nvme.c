@@ -1003,7 +1003,7 @@ static inline void __pci_epf_nvme_queue_response(struct pci_epf_nvme_cmd *epcmd)
 		would be the result of developper error in this driver */
 	WARN_ON_ONCE(pci_epf_nvme_map_cq(epf_nvme, epcmd->cqid));
 	memcpy_toio(cq->map.virt_addr + cq->tail * cq->qes, cqe,
-			sizeof(struct nvme_completion));
+		    sizeof(struct nvme_completion));
 
 	/* Advance cq tail */
 	cq->tail++;
@@ -1100,9 +1100,6 @@ static inline int pci_epf_nvme_fetch_sqes(struct pci_epf_nvme *epf_nvme, int qid
 			      num_cmds * sizeof(struct nvme_command));
 		sq->local_tail = sq->tail;
 	}
-
-	// map will auto unmap
-	//pci_epf_nvme_unmap_sq(epf_nvme, qid);
 
 	return num_cmds;
 }
