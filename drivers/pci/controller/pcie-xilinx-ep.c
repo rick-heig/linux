@@ -450,12 +450,17 @@ static int xilinx_pcie_parse_ep_dt(struct xilinx_pcie *xilinx,
 	if (IS_ERR(xilinx->irq_reg))
 		return PTR_ERR(xilinx->irq_reg);
 
+	/* Check for MSI-X property */
+	xilinx_pcie_epc_features.msix_capable = of_property_read_bool(node,
+		"msix-capable");
+
 	/* Get access to the register to set MSI-X addr */
 	regs = platform_get_resource_byname(pdev, IORESOURCE_MEM, "msix-addr-reg");
 	xilinx->msix_addr_reg = devm_pci_remap_cfg_resource(dev, regs);
 	if (IS_ERR(xilinx->msix_addr_reg)) {
 		dev_warn(dev, "Missing MSI-X address register\n");
 		xilinx->msix_addr_reg = NULL;
+		xilinx_pcie_epc_features.msix_capable = false;
 	}
 
 	/* Get access to the register to set MSI-X addr */
@@ -464,6 +469,7 @@ static int xilinx_pcie_parse_ep_dt(struct xilinx_pcie *xilinx,
 	if (IS_ERR(xilinx->msix_data_reg)) {
 		dev_warn(dev, "Missing MSI-X data register\n");
 		xilinx->msix_data_reg = NULL;
+		xilinx_pcie_epc_features.msix_capable = false;
 	}
 
 	/* Get the window memory ressource */
