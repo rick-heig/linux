@@ -78,6 +78,10 @@ static unsigned relaxed_poll_threshold = 100;
 static unsigned poll_delay_usecs = PCI_EPF_NVME_MIN_POLL_DELAY_US;
 static unsigned poll_relaxed_delay_usecs = PCI_EPF_NVME_MIN_POLL_DELAY_US * 100;
 
+#define PCI_EPF_NVME_MAX_STATS 1000
+static unsigned collected_read_stats = 0;
+static unsigned collected_write_stats = 0;
+
 #define MAX_PATH_LEN	8
 
 enum destination {
@@ -185,6 +189,21 @@ struct pci_epf_nvme_xfer_thread {
 	__le64				*prp_list_buf;
 };
 
+struct pci_epf_nvme_timestamps {
+	u64				creation;
+	u64				xfer_start;
+	u64				xfer_prp;
+	u64				xfer_end;
+	u64				backend_start;
+	u64				backend_end;
+	u64				completion_start;
+	u64				completion;
+};
+
+#define STATS_BUFFER_SIZE (sizeof(struct pci_epf_nvme_timestamps) * PCI_EPF_NVME_MAX_STATS)
+static struct pci_epf_nvme_timestamps *read_stats = NULL;
+static struct pci_epf_nvme_timestamps *write_stats = NULL;
+
 /*
  * Descriptor for commands sent by the host. This is also used internally for
  * fabrics commands to control our fabrics target.
@@ -219,6 +238,8 @@ struct pci_epf_nvme_cmd {
 	unsigned int			nr_segs;
 	struct pci_epf_nvme_segment	seg;
 	struct pci_epf_nvme_segment	*segs;
+
+	struct pci_epf_nvme_timestamps	ts;
 };
 
 /*
@@ -610,6 +631,7 @@ static void pci_epf_nvme_init_cmd(struct pci_epf_nvme *epf_nvme,
 	epcmd->sqid = sqid;
 	epcmd->cqid = cqid;
 	epcmd->status = NVME_SC_SUCCESS;
+	epcmd->ts.creation = ktime_get_ns();
 	/* next_destination, path, set to 0 by memset */
 }
 
@@ -650,8 +672,32 @@ static int pci_epf_nvme_alloc_cmd_segs(struct pci_epf_nvme_cmd *epcmd,
 	return 0;
 }
 
+static void pci_epf_nvme_collect_statistics(struct pci_epf_nvme_cmd *epcmd)
+{
+	if (!epcmd->sqid) /* Ignore admin commands */
+		return;
+
+	if (epcmd->cmd.common.opcode == nvme_cmd_read) {
+		if (collected_read_stats >= PCI_EPF_NVME_MAX_STATS)
+			return;
+		memcpy(&read_stats[collected_read_stats++], &epcmd->ts,
+		       sizeof(epcmd->ts));
+	}
+
+	if (epcmd->cmd.common.opcode == nvme_cmd_write) {
+		if (collected_write_stats >= PCI_EPF_NVME_MAX_STATS)
+			return;
+		memcpy(&write_stats[collected_write_stats++], &epcmd->ts,
+		       sizeof(epcmd->ts));
+	}
+}
+
 static void pci_epf_nvme_free_cmd(struct pci_epf_nvme_cmd *epcmd)
 {
+	epcmd->ts.completion = ktime_get_ns();
+
+	pci_epf_nvme_collect_statistics(epcmd);
+
 	atomic_dec_and_test(&epcmd->epf_nvme->in_flight_commands);
 
 	if (epcmd->ns)
@@ -808,6 +854,8 @@ static int pci_epf_nvme_xfer_thread_fn(void *arg)
 			continue;
 		}
 
+		epcmd->ts.xfer_start = ktime_get_ns();
+
 		if (do_transfer) {
 			epcmd->xfer_thread = xfer_thread;
 
@@ -818,12 +866,16 @@ static int pci_epf_nvme_xfer_thread_fn(void *arg)
 				continue;
 			}
 
+			epcmd->ts.xfer_prp = ktime_get_ns();
+
 			ret = pci_epf_nvme_cmd_transfer(epcmd);
 			if (ret) {
 				pci_epf_nvme_send_cmd_to_completion(epcmd);
 				continue;
 			}
 		}
+
+		epcmd->ts.xfer_end = ktime_get_ns();
 
 		pci_epf_nvme_send_cmd_to_next(epcmd);
 	}
@@ -969,6 +1021,8 @@ static inline void __pci_epf_nvme_queue_response(struct pci_epf_nvme_cmd *epcmd)
 	struct pci_epf_nvme_queue *cq = &ctrl->cq[epcmd->cqid];
 	struct nvme_completion *cqe = &epcmd->cqe;
 
+	epcmd->ts.completion_start = ktime_get_ns();
+
 	/*
 	 * Do not try to complete commands if the controller is not ready
 	 * anymore, e.g. after the host cleared CC.EN.
@@ -1011,6 +1065,8 @@ static inline void __pci_epf_nvme_queue_response(struct pci_epf_nvme_cmd *epcmd)
 		cq->tail = 0;
 		cq->phase ^= 1;
 	}
+
+	//epcmd->ts.irq_start = ktime_get_ns();
 
 	pci_epf_nvme_raise_irq(epf_nvme, cq);
 
@@ -1911,6 +1967,8 @@ static enum rq_end_io_ret pci_epf_nvme_backend_cmd_done_cb(struct request *req,
 {
 	struct pci_epf_nvme_cmd *epcmd = req->end_io_data;
 
+	epcmd->ts.backend_end = ktime_get_ns();
+
 	epcmd->status = nvme_req(req)->status;
 	blk_mq_free_request(req);
 
@@ -1992,6 +2050,9 @@ static inline
 void pci_epf_nvme_send_cmd_to_backend(struct pci_epf_nvme_cmd *epcmd)
 {
 	int ret;
+
+	epcmd->ts.backend_start = ktime_get_ns();
+
 	/* Always send admin commands, and non read/write commands */
 	if (do_backend || epcmd->sqid == 0 ||
 	    (epcmd->cmd.common.opcode != nvme_cmd_read &&
@@ -2831,6 +2892,14 @@ static int pci_epf_nvme_probe(struct pci_epf *epf,
 	if (ret)
 		return ret; /* XXX memory should be freed XXX */
 
+	read_stats = devm_kzalloc(&epf->dev, STATS_BUFFER_SIZE, GFP_KERNEL);
+	write_stats = devm_kzalloc(&epf->dev, STATS_BUFFER_SIZE, GFP_KERNEL);
+	dev_info(&epf_nvme->epf->dev, "Size of stats buffers: %zu bytes\n",
+		 STATS_BUFFER_SIZE);
+
+	if (!read_stats || !write_stats)
+		return -ENOMEM;
+
 	return 0;
 }
 
@@ -3101,6 +3170,51 @@ static ssize_t pci_epf_nvme_poll_relaxed_delay_usecs_store(struct config_item *i
 
 CONFIGFS_ATTR(pci_epf_nvme_, poll_relaxed_delay_usecs);
 
+static ssize_t pci_epf_nvme_statistics_show(struct config_item *item,
+					    char *page)
+{
+	return sysfs_emit(page, "read stats : %u\n"
+				"write stats : %u\n",
+			  collected_read_stats, collected_write_stats);
+}
+
+static ssize_t pci_epf_nvme_statistics_store(struct config_item *item,
+					     const char *page, size_t len)
+{
+	collected_read_stats = 0;
+	collected_write_stats = 0;
+
+	return len;
+}
+
+CONFIGFS_ATTR(pci_epf_nvme_, statistics);
+
+ssize_t pci_epf_nvme_rd_statistics_read(struct config_item *item,
+					void *buffer, size_t size)
+{
+	printk("Read rd statistics with %s buffer and size %zu\n",
+	       (buffer ? "" : " no "), size);
+
+	if (buffer)
+		memcpy(buffer, read_stats, STATS_BUFFER_SIZE);
+	return STATS_BUFFER_SIZE;
+}
+
+CONFIGFS_BIN_ATTR_RO(pci_epf_nvme_, rd_statistics, NULL, STATS_BUFFER_SIZE);
+
+ssize_t pci_epf_nvme_wr_statistics_read(struct config_item *item,
+					void *buffer, size_t size)
+{
+	printk("Read wr statistics with %s buffer and size %zu\n",
+	       (buffer ? "" : " no "), size);
+
+	if (buffer)
+		memcpy(buffer, write_stats, STATS_BUFFER_SIZE);
+	return STATS_BUFFER_SIZE;
+}
+
+CONFIGFS_BIN_ATTR_RO(pci_epf_nvme_, wr_statistics, NULL, STATS_BUFFER_SIZE);
+
 static struct configfs_attribute *pci_epf_nvme_attrs[] = {
 	&pci_epf_nvme_attr_ctrl_opts,
 	&pci_epf_nvme_attr_dma_enable,
@@ -3113,11 +3227,19 @@ static struct configfs_attribute *pci_epf_nvme_attrs[] = {
 	&pci_epf_nvme_attr_relaxed_poll_threshold,
 	&pci_epf_nvme_attr_poll_delay_usecs,
 	&pci_epf_nvme_attr_poll_relaxed_delay_usecs,
+	&pci_epf_nvme_attr_statistics,
+	NULL,
+};
+
+static struct configfs_bin_attribute *pci_epf_nvme_bin_attrs[] = {
+	&pci_epf_nvme_attr_rd_statistics,
+	&pci_epf_nvme_attr_wr_statistics,
 	NULL,
 };
 
 static const struct config_item_type pci_epf_nvme_group_type = {
 	.ct_attrs	= pci_epf_nvme_attrs,
+	.ct_bin_attrs	= pci_epf_nvme_bin_attrs,
 	.ct_owner	= THIS_MODULE,
 };
 
