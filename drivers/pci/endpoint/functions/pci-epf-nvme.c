@@ -81,6 +81,8 @@ static unsigned poll_relaxed_delay_usecs = PCI_EPF_NVME_MIN_POLL_DELAY_US * 100;
 #define PCI_EPF_NVME_MAX_STATS 1000
 static unsigned collected_read_stats = 0;
 static unsigned collected_write_stats = 0;
+/* Allows to filter on buffer size, allows to ignore spurious system reads */
+size_t collect_size_filter = 0;
 
 #define MAX_PATH_LEN	8
 
@@ -680,15 +682,19 @@ static void pci_epf_nvme_collect_statistics(struct pci_epf_nvme_cmd *epcmd)
 	if (epcmd->cmd.common.opcode == nvme_cmd_read) {
 		if (collected_read_stats >= PCI_EPF_NVME_MAX_STATS)
 			return;
-		memcpy(&read_stats[collected_read_stats++], &epcmd->ts,
-		       sizeof(epcmd->ts));
+		if (!collect_size_filter ||
+		    epcmd->buffer_size == collect_size_filter)
+			memcpy(&read_stats[collected_read_stats++], &epcmd->ts,
+			       sizeof(epcmd->ts));
 	}
 
 	if (epcmd->cmd.common.opcode == nvme_cmd_write) {
 		if (collected_write_stats >= PCI_EPF_NVME_MAX_STATS)
 			return;
-		memcpy(&write_stats[collected_write_stats++], &epcmd->ts,
-		       sizeof(epcmd->ts));
+		if (!collect_size_filter ||
+		    epcmd->buffer_size == collect_size_filter)
+			memcpy(&write_stats[collected_write_stats++], &epcmd->ts,
+			       sizeof(epcmd->ts));
 	}
 }
 
@@ -3189,6 +3195,29 @@ static ssize_t pci_epf_nvme_statistics_store(struct config_item *item,
 
 CONFIGFS_ATTR(pci_epf_nvme_, statistics);
 
+static ssize_t pci_epf_nvme_collect_size_filter_show(struct config_item *item,
+						     char *page)
+{
+	return sysfs_emit(page, "%zu\n", collect_size_filter);
+}
+
+static ssize_t pci_epf_nvme_collect_size_filter_store(struct config_item *item,
+						const char *page, size_t len)
+{
+	int ret;
+	unsigned size;
+
+	ret = kstrtouint(page, 10, &size);
+	if (ret)
+		return ret;
+
+	collect_size_filter = size;
+
+	return len;
+}
+
+CONFIGFS_ATTR(pci_epf_nvme_, collect_size_filter);
+
 ssize_t pci_epf_nvme_rd_statistics_read(struct config_item *item,
 					void *buffer, size_t size)
 {
@@ -3228,6 +3257,7 @@ static struct configfs_attribute *pci_epf_nvme_attrs[] = {
 	&pci_epf_nvme_attr_poll_delay_usecs,
 	&pci_epf_nvme_attr_poll_relaxed_delay_usecs,
 	&pci_epf_nvme_attr_statistics,
+	&pci_epf_nvme_attr_collect_size_filter,
 	NULL,
 };
 
