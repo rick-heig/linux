@@ -618,6 +618,9 @@ struct pci_epf_nvme_timestamps {
 	u64				backend_end;
 	u64				completion_start;
 	u64				completion;
+	u64				put_in_user_queue;
+	u64				user_space_start;
+	u64				user_space_end;
 };
 
 #define STATS_BUFFER_SIZE (sizeof(struct pci_epf_nvme_timestamps) * PCI_EPF_NVME_MAX_STATS)
@@ -3891,6 +3894,7 @@ static inline size_t pci_epf_nvme_rw_data_len(struct pci_epf_nvme_cmd *epcmd)
 static inline
 void pci_epf_nvme_send_cmd_to_user(struct pci_epf_nvme_cmd *epcmd)
 {
+	epcmd->ts.put_in_user_queue = ktime_get_ns();
 	/* XXX TODO Handle full FIFO XXX (unlikely) */
 
 	/* Lock because this is called from multiple threads */
@@ -4267,6 +4271,7 @@ static ssize_t tsp_read(struct file *file, char __user *buf, size_t count,
 		}
 	}
 	count += tfd->epcmd->buffer_size;
+	tfd->epcmd->ts.user_space_start = ktime_get_ns();
 
 	//dev_info(&epf_nvme->epf->dev, "TSP: Cmd read from userspace\n");
 	return count;
@@ -4357,6 +4362,7 @@ static ssize_t tsp_admin_read(struct file *file, char __user *buf, size_t count,
 		}
 	}
 	count += tfd->epcmd->buffer_size;
+	tfd->epcmd->ts.user_space_start = ktime_get_ns();
 
 	return count;
 
@@ -4399,6 +4405,7 @@ static ssize_t tsp_write(struct file *file, const char __user *buf, size_t count
 		}
 	}
 
+	tfd->epcmd->ts.user_space_end = ktime_get_ns();
 	dev_dbg(&epf_nvme->epf->dev, "TSP: Completion write from userspace\n");
 
 	pci_epf_nvme_send_cmd_to_next(tfd->epcmd);
