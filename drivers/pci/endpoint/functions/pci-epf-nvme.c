@@ -3218,6 +3218,14 @@ static ssize_t pci_epf_nvme_collect_size_filter_store(struct config_item *item,
 
 CONFIGFS_ATTR(pci_epf_nvme_, collect_size_filter);
 
+ssize_t pci_epf_nvme_statistics_buffer_size_show(struct config_item *item,
+						 char* page)
+{
+	return sysfs_emit(page, "%zu\n", STATS_BUFFER_SIZE);
+}
+
+CONFIGFS_ATTR_RO(pci_epf_nvme_, statistics_buffer_size);
+
 ssize_t pci_epf_nvme_rd_statistics_read(struct config_item *item,
 					void *buffer, size_t size)
 {
@@ -3258,6 +3266,7 @@ static struct configfs_attribute *pci_epf_nvme_attrs[] = {
 	&pci_epf_nvme_attr_poll_relaxed_delay_usecs,
 	&pci_epf_nvme_attr_statistics,
 	&pci_epf_nvme_attr_collect_size_filter,
+	&pci_epf_nvme_attr_statistics_buffer_size,
 	NULL,
 };
 
