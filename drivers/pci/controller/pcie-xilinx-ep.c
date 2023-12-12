@@ -402,7 +402,6 @@ static const struct pci_epc_ops xilinx_pcie_epc_ops = {
 	.map_info	= xilinx_pcie_ep_map_info,
 	.map_addr	= xilinx_pcie_ep_map_addr,
 	.unmap_addr	= xilinx_pcie_ep_unmap_addr,
-	/* Don't support MSI or MSI-X for the moment */
 	.set_msi	= xilinx_pcie_ep_set_msi,
 	.get_msi	= xilinx_pcie_ep_get_msi,
 	.set_msix	= xilinx_pcie_ep_set_msix,
