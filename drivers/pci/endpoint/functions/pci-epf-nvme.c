@@ -3050,7 +3050,7 @@ static u16 tsp_compute_checksum(struct pci_epf_nvme *nvme,
 	void *cmb_source, *cmb_dest;
 	u32 *source_as_u32, *dest_as_u32, checksum, i;
 
-	pci_epf_nvme_print_cmb_info(nvme);
+	//pci_epf_nvme_print_cmb_info(nvme);
 
 	if (pci_epf_nvme_addr_in_cmb(nvme, source) &&
 	    pci_epf_nvme_addr_in_cmb(nvme, dest) &&
@@ -3061,12 +3061,12 @@ static u16 tsp_compute_checksum(struct pci_epf_nvme *nvme,
 		source_as_u32 = (u32*)cmb_source;
 		dest_as_u32 = (u32*)cmb_dest;
 		checksum = 0;
-		dev_info(&nvme->epf->dev, "Computing checksum :\n");
+		//dev_info(&nvme->epf->dev, "Computing checksum :\n");
 		for (i = 0; i < len/sizeof(u32); ++i) {
 			checksum += source_as_u32[i];
 			//dev_info(&nvme->epf->dev, "value : %#08lx\n", source_as_u32[i]);
 		}
-		dev_info(&nvme->epf->dev, "Result : %#08x\n", checksum);
+		//dev_info(&nvme->epf->dev, "Result : %#08x\n", checksum);
 		*dest_as_u32 = checksum;
 	} else {
 		dev_err(&nvme->epf->dev, "Data is outside of CMB\n"
