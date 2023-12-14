@@ -2,7 +2,16 @@
 /*
  * NVMe function driver for PCI Endpoint Framework
  *
+ * Computational storage and multi-threaded NVMe driver :
+ * Copyright (C) Rick Wertenbroek
+ *
+ * NVMe driver :
+ * https://github.com/damien-lemoal/linux/commit/45fa62daf92455950044b863a911822e387f6eea
+ * Damien Le Moal and Rick Wertenbroek
+ *
+ * Original idea and first NVMe driver https://lwn.net/Articles/804369/ :
  * Copyright (C) 2019 SiFive
+ *
  */
 
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
