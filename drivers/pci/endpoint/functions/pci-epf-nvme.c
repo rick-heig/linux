@@ -4854,10 +4854,11 @@ static int pci_epf_nvme_probe(struct pci_epf *epf,
 
 	/* Prepare generic transfer thread info if we want to do transfers
 	   from within the sq_poll work function */
-	epf_nvme->sq_xfer_info.prp_list_buf = kzalloc(NVME_CTRL_PAGE_SIZE,
-						      GFP_KERNEL);
+	epf_nvme->sq_xfer_info.prp_list_buf = devm_kzalloc(&epf->dev,
+							   NVME_CTRL_PAGE_SIZE,
+							   GFP_KERNEL);
 	if (!epf_nvme->sq_xfer_info.prp_list_buf)
-		return -ENOMEM; /* XXX memory should be freed XXX */
+		return -ENOMEM;
 	epf_nvme->sq_xfer_info.dma.dma_supported = false;
 	epf_nvme->sq_xfer_info.tid = -1; /* No thread ID, this is special */
 	epf_nvme->sq_xfer_info.epf_nvme = epf_nvme;
@@ -4879,13 +4880,13 @@ static int pci_epf_nvme_probe(struct pci_epf *epf,
 	ret = kfifo_alloc(&epf_nvme->xfer_fifo, PCI_EPF_NVME_FIFO_SIZE,
 			  GFP_KERNEL);
 	if (ret)
-		return ret; /* XXX memory should be freed XXX */
+		return ret;
 
 	spin_lock_init(&epf_nvme->completion_fifo_wr_lock);
 	ret = kfifo_alloc(&epf_nvme->completion_fifo, PCI_EPF_NVME_FIFO_SIZE,
 		GFP_KERNEL);
 	if (ret)
-		return ret; /* XXX memory should be freed XXX */
+		return ret;
 
 	read_stats = devm_kzalloc(&epf->dev, STATS_BUFFER_SIZE, GFP_KERNEL);
 	write_stats = devm_kzalloc(&epf->dev, STATS_BUFFER_SIZE, GFP_KERNEL);
