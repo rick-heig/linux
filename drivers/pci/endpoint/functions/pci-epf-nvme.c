@@ -33,6 +33,7 @@
 #include <linux/kthread.h>
 #include <linux/cdev.h>
 #include <linux/uio_driver.h>
+#include <linux/leds.h>
 #include <net/sock.h>
 #include <generated/utsrelease.h>
 
@@ -71,6 +72,11 @@
 #define CMBMSC_CRE_BIT			(1 << 0)
 #define CMBMSC_CMSE_BIT			(1 << 1)
 #define CMBMSC_CBA_MASK			GENMASK(63, 12)
+
+/*
+ * LED trigger for indicating the the NVMe PCI EP is ready
+ */
+DEFINE_LED_TRIGGER(ledtrig_nvme_ready);
 
 /* Network relay related below */
 #define TSP_RELAY_BUFFER_SIZE (SZ_4K - sizeof(u32))
@@ -4809,6 +4815,8 @@ static int pci_epf_nvme_bind(struct pci_epf *epf)
 		queue_delayed_work(epf_nvme_reg_wq, &epf_nvme->reg_poll,
 				   msecs_to_jiffies(1));
 
+	led_trigger_event(ledtrig_nvme_ready, LED_FULL);
+
 	return 0;
 }
 
@@ -4828,6 +4836,8 @@ static void pci_epf_nvme_unbind(struct pci_epf *epf)
 		pci_epf_free_space(epf, epf_nvme->reg[bar], bar,
 				   PRIMARY_INTERFACE);
 	}
+
+	led_trigger_event(ledtrig_nvme_ready, LED_OFF);
 }
 
 static struct pci_epf_header epf_nvme_pci_header = {
@@ -5432,6 +5442,8 @@ static int __init pci_epf_nvme_init(void)
 	if (ret)
 		goto out_cache;
 
+	led_trigger_register_simple("nvme-ep-ready", &ledtrig_nvme_ready);
+
 	pr_info("Registered driver\n");
 
 	return 0;
@@ -5468,6 +5480,9 @@ static void __exit pci_epf_nvme_exit(void)
 
 	unregister_chrdev_region(MKDEV(dev_major, 0), MINORMASK);
 #endif
+
+	led_trigger_unregister_simple(ledtrig_nvme_ready);
+
 	pr_info("Unregistered driver\n");
 }
 module_exit(pci_epf_nvme_exit);
