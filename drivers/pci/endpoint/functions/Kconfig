@@ -51,6 +51,7 @@ config PCI_EPF_MHI
 config PCI_EPF_NVME
 	tristate "PCI Endpoint NVMe function driver"
 	depends on PCI_ENDPOINT && NVME_TARGET
+	select UIO
 	help
 	   Enable this configuration option to enable the NVMe function
 	   driver for PCI Endpoint.
