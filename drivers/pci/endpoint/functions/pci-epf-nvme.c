@@ -988,7 +988,7 @@ static int pci_epf_nvme_dma_transfer(struct pci_epf_nvme *epf_nvme,
 	phys_addr_t dma_phys_addr;
 	int ret;
 
-	dma_phys_addr = dma_map_single(dma->dma_dev, buf, map->size, dir);
+	dma_phys_addr = dma_map_single(dma->dma_dev, buf, map->pci_size, dir);
 	if (dma_mapping_error(dma->dma_dev, dma_phys_addr)) {
 		dev_err(&epf_nvme->epf->dev,
 			"Failed to map source buffer addr\n");
@@ -998,19 +998,19 @@ static int pci_epf_nvme_dma_transfer(struct pci_epf_nvme *epf_nvme,
 	switch (dir) {
 	case DMA_FROM_DEVICE:
 		ret = pci_epf_nvme_do_dma(epf_nvme, dma, dma_phys_addr,
-					  map->phys_addr, map->size,
+					  map->phys_addr, map->pci_size,
 					  map->pci_addr, DMA_DEV_TO_MEM);
 		break;
 	case DMA_TO_DEVICE:
 		ret = pci_epf_nvme_do_dma(epf_nvme, dma, map->phys_addr,
-					  dma_phys_addr, map->size,
+					  dma_phys_addr, map->pci_size,
 					  map->pci_addr, DMA_MEM_TO_DEV);
 		break;
 	default:
 		ret = -EINVAL;
 	}
 
-	dma_unmap_single(dma->dma_dev, dma_phys_addr, map->size, dir);
+	dma_unmap_single(dma->dma_dev, dma_phys_addr, map->pci_size, dir);
 
 	return ret;
 }
@@ -1021,10 +1021,10 @@ static int pci_epf_nvme_mmio_transfer(struct pci_epf_nvme *nvme,
 {
 	switch (dir) {
 	case DMA_FROM_DEVICE:
-		memcpy_fromio(buf, map->virt_addr, map->size);
+		memcpy_fromio(buf, map->virt_addr, map->pci_size);
 		return 0;
 	case DMA_TO_DEVICE:
-		memcpy_toio(map->virt_addr, buf, map->size);
+		memcpy_toio(map->virt_addr, buf, map->pci_size);
 		return 0;
 	default:
 		return -EINVAL;
@@ -1114,7 +1114,7 @@ static int pci_epf_nvme_map_cmb_segment(struct pci_epf_nvme *epf_nvme,
 	}
 
 	map->pci_addr = seg->pci_addr;
-	map->phys_size = seg->size;
+	map->map_size = seg->size;
 	map->phys_addr = epf_nvme->epf->bar[CMB_BIR].phys_addr + offset;
 	map->virt_addr = (char*)(epf_nvme->reg[CMB_BIR]) + offset;
 
@@ -1153,7 +1153,7 @@ static int pci_epf_nvme_transfer(struct pci_epf_nvme_xfer_thread *xfer_thread,
 
 		/* Do not bother with DMA for small transfers */
 		if (no_dma || !xfer_thread->dma.dma_supported ||
-		    map.size < ctrl->mps)
+		    map.pci_size < ctrl->mps)
 			ret = pci_epf_nvme_mmio_transfer(epf_nvme, &map,
 							 buf, dir);
 		else
