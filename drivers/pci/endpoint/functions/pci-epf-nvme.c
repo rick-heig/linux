@@ -2570,6 +2570,9 @@ static void pci_epf_nvme_enable_ctrl(struct pci_epf_nvme *epf_nvme)
 			epf->epc->num_windows - 2);
 
 	if (effective_xfer_threads < 1) {
+		if (effective_xfer_threads < 0) {
+			effective_xfer_threads = 0;
+		}
 		dev_err(&epf_nvme->epf->dev, "Cannot init transfer threads\n");
 		goto disable;
 	} else if (effective_xfer_threads != num_xfer_threads) {
