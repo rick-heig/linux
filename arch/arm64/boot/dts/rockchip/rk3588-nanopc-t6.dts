@@ -914,6 +914,15 @@
 	status = "okay";
 };
 
+&u2phy0 {
+	status = "okay";
+};
+
+&u2phy0_otg {
+	phy-supply = <&vbus5v0_typec>;
+	status = "okay";
+};
+
 &u2phy1 {
 	status = "okay";
 };
@@ -944,6 +953,19 @@
 };
 
 &usb_host1_ohci {
+	status = "okay";
+};
+
+&usbdp_phy0_u3 {
+	phy-supply = <&vbus5v0_typec>;
+	status = "okay";
+};
+
+&usbdp_phy0 {
+	status = "okay";
+};
+
+&usb_host0_xhci {
 	status = "okay";
 };
 
