@@ -107,3 +107,14 @@ config PHY_ROCKCHIP_USB
 	select GENERIC_PHY
 	help
 	  Enable this to support the Rockchip USB 2.0 PHY.
+
+config PHY_ROCKCHIP_USBDP
+	tristate "Rockchip USBDP Combo PHY Driver"
+	depends on (ARCH_ROCKCHIP && OF) || COMPILE_TEST
+	select EXTCON
+	select GENERIC_PHY
+	select MFD_SYSCON
+	select RESET_CONTROLLER
+	select TYPEC
+	help
+	  Enable this to support the Rockhip USBDP Combo PHY.
