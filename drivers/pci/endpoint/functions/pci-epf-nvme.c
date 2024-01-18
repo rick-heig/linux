@@ -911,11 +911,11 @@ static int pci_epf_nvme_do_dma(struct pci_epf_nvme *epf_nvme,
 	int ret;
 
 	if (dir == DMA_DEV_TO_MEM) {
-		chan = dma->dma_chan_tx;
+		chan = dma->dma_chan_rx;
 		dma_local = dma_dst;
 	} else {
 		dma_local = dma_src;
-		chan = dma->dma_chan_rx;
+		chan = dma->dma_chan_tx;
 	}
 	if (IS_ERR_OR_NULL(chan)) {
 		dev_err(&epf_nvme->epf->dev, "Invalid DMA channel\n");
