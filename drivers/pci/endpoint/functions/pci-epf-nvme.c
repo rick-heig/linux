@@ -830,10 +830,10 @@ static bool pci_epf_nvme_init_dma(struct pci_epf_nvme *epf_nvme,
 		goto release_rx;
 	dma->dma_chan_tx = chan;
 
-	dev_info(dev, "DMA RX channel %s: maximum segment size %d B\n",
+	dev_info(dev, "DMA RX channel %s: maximum segment size %u B\n",
 		 dma_chan_name(dma->dma_chan_rx),
 		 dma_get_max_seg_size(dma->dma_chan_rx->device->dev));
-	dev_info(dev, "DMA TX channel %s: maximum segment size %d B\n",
+	dev_info(dev, "DMA TX channel %s: maximum segment size %u B\n",
 		 dma_chan_name(dma->dma_chan_tx),
 		 dma_get_max_seg_size(dma->dma_chan_tx->device->dev));
 
