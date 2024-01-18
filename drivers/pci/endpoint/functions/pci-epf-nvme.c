@@ -903,6 +903,7 @@ static int pci_epf_nvme_do_dma(struct pci_epf_nvme *epf_nvme,
 			      size_t len, dma_addr_t dma_remote,
 			      enum dma_transfer_direction dir)
 {
+	struct device *dev = &epf_nvme->epf->dev;
 	struct dma_async_tx_descriptor *tx;
 	struct dma_slave_config sconf = {};
 	unsigned long time_left;
@@ -918,7 +919,7 @@ static int pci_epf_nvme_do_dma(struct pci_epf_nvme *epf_nvme,
 		chan = dma->dma_chan_tx;
 	}
 	if (IS_ERR_OR_NULL(chan)) {
-		dev_err(&epf_nvme->epf->dev, "Invalid DMA channel\n");
+		dev_err(dev, "Invalid DMA channel\n");
 		return -EINVAL;
 	}
 
@@ -930,23 +931,29 @@ static int pci_epf_nvme_do_dma(struct pci_epf_nvme *epf_nvme,
 			sconf.src_addr = dma_remote;
 
 		if (dmaengine_slave_config(chan, &sconf)) {
-			dev_err(&epf_nvme->epf->dev,
-				"DMA slave config failed\n");
+			dev_err(dev, "DMA slave config failed\n");
 			return -EIO;
 		}
 
 		tx = dmaengine_prep_slave_single(chan, dma_local, len, dir,
 					DMA_CTRL_ACK | DMA_PREP_INTERRUPT);
+
+		if (!tx) {
+			dev_err(dev, "dmaengine_prep_slave_single failed\n");
+			return -EIO;
+		}
 	} else {
 		tx = dmaengine_prep_dma_memcpy(chan, dma_dst, dma_src, len,
 					DMA_CTRL_ACK | DMA_PREP_INTERRUPT);
-	}
-	if (!tx) {
-		dev_err(&epf_nvme->epf->dev, "Prepare DMA memcpy failed\n");
-		return -EIO;
+
+		if (!tx) {
+			dev_err(dev, "dmaengine_prep_dma_memcpy failed\n");
+			return -EIO;
+		}
 	}
 
 	reinit_completion(&dma->dma_complete);
+	dma->dma_status = DMA_IN_PROGRESS;
 	dma->dma_chan = chan;
 	tx->callback = pci_epf_nvme_dma_callback;
 	tx->callback_param = dma;
@@ -954,7 +961,7 @@ static int pci_epf_nvme_do_dma(struct pci_epf_nvme *epf_nvme,
 
 	ret = dma_submit_error(dma->dma_cookie);
 	if (ret) {
-		dev_err(&epf_nvme->epf->dev, "DMA tx_submit failed %d\n", ret);
+		dev_err(dev, "DMA tx_submit failed %d\n", ret);
 		goto terminate;
 	}
 
@@ -963,13 +970,13 @@ static int pci_epf_nvme_do_dma(struct pci_epf_nvme *epf_nvme,
 	time_left = wait_for_completion_timeout(&dma->dma_complete,
 						HZ * 10);
 	if (!time_left) {
-		dev_err(&epf_nvme->epf->dev, "DMA transfer timeout\n");
+		dev_err(dev, "DMA transfer timeout\n");
 		ret = -ETIMEDOUT;
 		goto terminate;
 	}
 
 	if (dma->dma_status != DMA_COMPLETE) {
-		dev_err(&epf_nvme->epf->dev, "DMA transfer failed\n");
+		dev_err(dev, "DMA transfer failed\n");
 		ret = -EIO;
 	}
 
@@ -1007,6 +1014,7 @@ static int pci_epf_nvme_dma_transfer(struct pci_epf_nvme *epf_nvme,
 					  map->pci_addr, DMA_MEM_TO_DEV);
 		break;
 	default:
+		dev_err(&epf_nvme->epf->dev, "DMA xfer missing direction\n");
 		ret = -EINVAL;
 	}
 
@@ -1027,6 +1035,7 @@ static int pci_epf_nvme_mmio_transfer(struct pci_epf_nvme *nvme,
 		memcpy_toio(map->virt_addr, buf, map->pci_size);
 		return 0;
 	default:
+		dev_err(&nvme->epf->dev, "MMIO xfer missing direction\n");
 		return -EINVAL;
 	}
 }
@@ -1141,15 +1150,26 @@ static int pci_epf_nvme_transfer(struct pci_epf_nvme_xfer_thread *xfer_thread,
 		/* If we have to read/write our own CMB we do not do it through
 		 * PCI so the map is different based on CMB/PCI */
 		if (in_cmb) {
+			dev_dbg(&epf->dev, "Map in CMB !\n");
 			ret = pci_epf_nvme_map_cmb_segment(epf_nvme, seg, &map);
 			if (ret)
 				return ret;
 			map_size = seg->size;
 		} else {
 			map_size = pci_epf_mem_map(epf, addr, size, &map);
-			if (map_size < 0)
+			if (map_size < 0) {
+				dev_err(&epf->dev, "Failed to map PCI space\n");
 				return map_size;
+			}
+			if (WARN_ON_ONCE(map_size > size))
+				return -EIO;
 		}
+
+		dev_dbg(&epf->dev,
+			"Mapped PCI addr 0x%llx (0x%llx) to virt addr 0x%llx, "
+			"phys addr 0x%llx, size %zd (%zu) / %zu B\n",
+			map.pci_addr, map.map_pci_addr, (u64)map.virt_addr,
+			map.phys_addr, map_size, map.pci_size, size);
 
 		/* Do not bother with DMA for small transfers */
 		if (no_dma || !xfer_thread->dma.dma_supported ||
@@ -1303,6 +1323,7 @@ static int pci_epf_nvme_cmd_transfer(struct pci_epf_nvme_cmd *epcmd)
 	/* If the transfer length or direction is not defined */
 	if (!epcmd->transfer_len || dir == DMA_NONE ||
 	    dir == DMA_BIDIRECTIONAL) {
+		dev_err(&epf_nvme->epf->dev, "Undefined size of direction\n");
 		epcmd->status = NVME_SC_INTERNAL | NVME_SC_DNR;
 		return -EIO;
 	}
@@ -1460,6 +1481,7 @@ static int pci_epf_nvme_xfer_thread_fn(void *arg)
 	struct pci_epf_nvme_xfer_thread *xfer_thread = arg;
 	struct pci_epf_nvme *epf_nvme = xfer_thread->epf_nvme;
 	struct pci_epf_nvme_cmd *epcmd;
+	struct device *dev = &epf_nvme->epf->dev;
 
 	while(1) {
 		spin_lock(&epf_nvme->xfer_fifo_rd_lock);
@@ -1482,7 +1504,7 @@ static int pci_epf_nvme_xfer_thread_fn(void *arg)
 		spin_unlock(&epf_nvme->xfer_fifo_rd_lock);
 
 		if (ret != 1) {
-			dev_err(&epf_nvme->epf->dev,
+			dev_err(dev,
 			        "Could not get element from transfer FIFO\n");
 			continue;
 		}
@@ -1495,6 +1517,7 @@ static int pci_epf_nvme_xfer_thread_fn(void *arg)
 			/* Get the host buffer segments */
 			ret = pci_epf_nvme_cmd_parse_dptr(epcmd);
 			if (ret) {
+				dev_err(dev, "Failed parse dptr\n");
 				pci_epf_nvme_send_cmd_to_completion(epcmd);
 				continue;
 			}
@@ -1503,6 +1526,7 @@ static int pci_epf_nvme_xfer_thread_fn(void *arg)
 
 			ret = pci_epf_nvme_cmd_transfer(epcmd);
 			if (ret) {
+				dev_err(dev, "Failed transfer\n");
 				pci_epf_nvme_send_cmd_to_completion(epcmd);
 				continue;
 			}
