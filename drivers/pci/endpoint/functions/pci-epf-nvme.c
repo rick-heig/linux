@@ -2592,9 +2592,12 @@ static void pci_epf_nvme_enable_ctrl(struct pci_epf_nvme *epf_nvme)
 
 	/* One window is used by SQ poll thread, one by CQ thread, and each
 	 * xfer thread requires its own window */
+#if 0
 	effective_xfer_threads = min_t(int, num_xfer_threads,
 			epf->epc->num_windows - 2);
-
+#else
+	effective_xfer_threads = num_xfer_threads;
+#endif
 	if (effective_xfer_threads < 1) {
 		if (effective_xfer_threads < 0) {
 			effective_xfer_threads = 0;
