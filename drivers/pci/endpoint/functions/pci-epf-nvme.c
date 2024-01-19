@@ -1156,6 +1156,9 @@ static int pci_epf_nvme_transfer(struct pci_epf_nvme_xfer_thread *xfer_thread,
 				return ret;
 			map_size = seg->size;
 		} else {
+			dev_dbg(&epf->dev,
+				"Mapping PCI addr 0x%llx of size %zu B\n",
+				addr, size);
 			map_size = pci_epf_mem_map(epf, addr, size, &map);
 			if (map_size < 0) {
 				dev_err(&epf->dev, "Failed to map PCI space\n");
