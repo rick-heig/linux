@@ -2428,16 +2428,17 @@ static void pci_epf_nvme_free_thread(struct pci_epf_nvme_xfer_thread *thread)
 	}
 }
 
-static void pci_epf_nvme_disable_ctrl(struct pci_epf_nvme *epf_nvme,
-				      bool shutdown)
+static void pci_epf_nvme_disable_ctrl(struct pci_epf_nvme *epf_nvme)
 {
 	struct pci_epf_nvme_ctrl *ctrl = &epf_nvme->ctrl;
 	struct pci_epf *epf = epf_nvme->epf;
 	int qid, val, temp = 0;
 	bool empty = false;
 
-	dev_info(&epf->dev, "%s controller\n",
-		 shutdown ? "Shutting down" : "Disabling");
+	if (epf_nvme->disabled)
+		return;
+
+	dev_info(&epf->dev, "Disabling controller\n");
 
 	/* Stop polling the submission queues */
 	cancel_delayed_work_sync(&epf_nvme->sq_poll);
@@ -2499,16 +2500,14 @@ static void pci_epf_nvme_disable_ctrl(struct pci_epf_nvme *epf_nvme,
 	epf_nvme->currently_mapped_sq = NULL;
 	epf_nvme->currently_mapped_cq = NULL;
 
-	if (shutdown) {
-		pci_epf_nvme_delete_ctrl(epf);
-		ctrl->cc &= ~NVME_CC_SHN_NORMAL;
-		ctrl->csts |= NVME_CSTS_SHST_CMPLT;
-	}
-
-	/* Tell the host we are done */
+	/* Tell the root complex we are done */
 	ctrl->csts &= ~NVME_CSTS_RDY;
-	pci_epf_nvme_reg_write32(ctrl, NVME_REG_CSTS, ctrl->csts);
+	if (ctrl->cc & NVME_CC_SHN_NORMAL) {
+		ctrl->csts |= NVME_CSTS_SHST_CMPLT;
+		ctrl->cc &= ~NVME_CC_SHN_NORMAL;
+	}
 	ctrl->cc &= ~NVME_CC_ENABLE;
+	pci_epf_nvme_reg_write32(ctrl, NVME_REG_CSTS, ctrl->csts);
 	pci_epf_nvme_reg_write32(ctrl, NVME_REG_CC, ctrl->cc);
 }
 
@@ -2629,7 +2628,7 @@ static void pci_epf_nvme_enable_ctrl(struct pci_epf_nvme *epf_nvme)
 
 	return;
 disable:
-	pci_epf_nvme_disable_ctrl(epf_nvme, false);
+	pci_epf_nvme_disable_ctrl(epf_nvme);
 }
 
 static enum rq_end_io_ret pci_epf_nvme_backend_cmd_done_cb(struct request *req,
@@ -4181,13 +4180,9 @@ static void pci_epf_nvme_reg_poll(struct work_struct *work)
 	}
 
 	/* If CC.EN was cleared by the host, disable the controller */
-	shutdown = ctrl->cc & NVME_CC_SHN_NORMAL;
 	if (((old_cc & NVME_CC_ENABLE) && !(ctrl->cc & NVME_CC_ENABLE)) ||
-	    shutdown) {
-		pci_epf_nvme_disable_ctrl(epf_nvme, shutdown);
-		if (shutdown)
-			return;
-	}
+	    ctrl->cc & NVME_CC_SHN_NORMAL)
+		pci_epf_nvme_disable_ctrl(epf_nvme);
 
 again:
 	queue_delayed_work(epf_nvme_reg_wq, &epf_nvme->reg_poll,
@@ -4769,6 +4764,8 @@ static int pci_epf_nvme_link_up(struct pci_epf *epf)
 	struct pci_epf_nvme *epf_nvme = epf_get_drvdata(epf);
 	int ret;
 
+	dev_info(&epf->dev, "Link UP\n");
+
 	if (!epf_nvme->ctrl.ctrl) {
 		/*
 		 * We come here if the host was restarted after
@@ -4786,9 +4783,23 @@ static int pci_epf_nvme_link_up(struct pci_epf *epf)
 	return 0;
 }
 
+static int pci_epf_nvme_link_down(struct pci_epf *epf)
+{
+	struct pci_epf_nvme *epf_nvme = epf_get_drvdata(epf);
+
+	dev_info(&epf->dev, "Link DOWN\n");
+
+	/* Stop polling BAR registers and disable the controller */
+	cancel_delayed_work(&epf_nvme->reg_poll);
+	pci_epf_nvme_disable_ctrl(epf_nvme);
+
+	return 0;
+}
+
 static const struct pci_epf_event_ops pci_epf_nvme_event_ops = {
 	.core_init = pci_epf_nvme_core_init,
 	.link_up = pci_epf_nvme_link_up,
+	.link_down = pci_epf_nvme_link_down,
 };
 
 static int pci_epf_nvme_bind(struct pci_epf *epf)
@@ -4854,7 +4865,7 @@ static void pci_epf_nvme_unbind(struct pci_epf *epf)
 
 	cancel_delayed_work(&epf_nvme->reg_poll);
 
-	pci_epf_nvme_disable_ctrl(epf_nvme, true);
+	pci_epf_nvme_disable_ctrl(epf_nvme);
 
 	for (bar = BAR_0; bar < PCI_STD_NUM_BARS; bar++) {
 		if (!epf_nvme->reg[bar])
