@@ -315,9 +315,6 @@ static int dw_pcie_ep_map_info(struct pci_epc *epc, u8 fn, u8 vfn,
 	struct dw_pcie *pci = to_dw_pcie_from_ep(ep);
 	phys_addr_t mask = pci->region_align - 1;
 
-	if (map->pci_addr > pci->region_limit)
-		return -EINVAL;
-
 	map->map_pci_addr = map->pci_addr & ~mask;
 	map->map_ofst = map->pci_addr & mask;
 	map->map_size = ALIGN(map->map_ofst + map->pci_size, pci->region_align);
