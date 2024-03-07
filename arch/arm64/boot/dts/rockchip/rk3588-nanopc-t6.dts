@@ -13,8 +13,8 @@
 #include "rk3588.dtsi"
 
 / {
-	model = "FriendlyElec NanoPC-T6";
-	compatible = "friendlyarm,nanopc-t6", "rockchip,rk3588";
+	model = "FriendlyElec CM3588";
+	compatible = "friendlyelec,cm3588", "rockchip,rk3588";
 
 	aliases {
 		mmc0 = &sdhci;
@@ -454,18 +454,25 @@
 };
 
 &pcie2x1l0 {
-	reset-gpios = <&gpio4 RK_PB3 GPIO_ACTIVE_HIGH>;
+	/* reset-gpios = <&gpio4 RK_PB3 GPIO_ACTIVE_HIGH>; */
+	reset-gpios = <&gpio4 RK_PB4 GPIO_ACTIVE_HIGH>;
 	vpcie3v3-supply = <&vcc_3v3_pcie20>;
 	pinctrl-names = "default";
 	pinctrl-0 = <&pcie2_0_rst>;
-	status = "okay";
+	phys = <&pcie30phy>;
+	num-lanes = <1>;
+	max-link-speed = <3>;
+	status = "disabled";
 };
 
 &pcie2x1l1 {
 	reset-gpios = <&gpio4 RK_PA2 GPIO_ACTIVE_HIGH>;
-	vpcie3v3-supply = <&vcc3v3_pcie2x1l0>;
+	vpcie3v3-supply = <&vcc3v3_pcie30>;
 	pinctrl-names = "default";
 	pinctrl-0 = <&pcie2_1_rst>;
+	phys = <&pcie30phy>;
+	num-lanes = <1>;
+	max-link-speed = <2>;
 	status = "okay";
 };
 
@@ -478,6 +485,16 @@
 };
 
 &pcie30phy {
+	data-lanes = <&pcie3x4_ep &pcie2x1l0 &pcie3x2 &pcie2x1l1>;
+	/* data-lanes = <1 3 2 4>; */
+	status = "okay";
+};
+
+&pcie3x2 {
+	reset-gpios = <&gpio4 RK_PB3 GPIO_ACTIVE_HIGH>;
+	/* TODO pin-ctrl */
+	vpcie3v3-supply = <&vcc3v3_pcie30>;
+	num-lanes = <1>;
 	status = "okay";
 };
 
@@ -489,6 +506,7 @@
 
 &pcie3x4_ep {
 	vpcie3v3-supply = <&vcc3v3_pcie30>;
+	num-lanes = <1>;
 	status = "okay";
 };
 
@@ -517,7 +535,7 @@
 
 	pcie {
 		pcie2_0_rst: pcie2-0-rst {
-			rockchip,pins = <4 RK_PB3 RK_FUNC_GPIO &pcfg_pull_none>;
+			rockchip,pins = <4 RK_PB4 RK_FUNC_GPIO &pcfg_pull_none>;
 		};
 
 		pcie2_1_rst: pcie2-1-rst {
@@ -915,6 +933,10 @@
 			};
 		};
 	};
+};
+
+&gmac1 {
+	status = "disabled";
 };
 
 &tsadc {
