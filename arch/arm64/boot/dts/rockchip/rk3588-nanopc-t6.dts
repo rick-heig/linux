@@ -464,17 +464,31 @@
 };
 
 &pcie30phy {
+	/* The phy is split into 2x2 between the two controllers */
+	data-lanes = <&pcie3x4_ep &pcie3x4_ep &pcie3x2 &pcie3x2>;
+	status = "okay";
+};
+
+&pcie3x2 {
+	/* The reset is the same as on the x4 controller */
+	reset-gpios = <&gpio4 RK_PB6 GPIO_ACTIVE_HIGH>;
+	/* TODO pin-ctrl */
+	vpcie3v3-supply = <&vcc3v3_pcie30>;
+	num-lanes = <1>;
 	status = "okay";
 };
 
 &pcie3x4 {
+	/* The x4 controller is not used in RC mode */
 	reset-gpios = <&gpio4 RK_PB6 GPIO_ACTIVE_HIGH>;
 	vpcie3v3-supply = <&vcc3v3_pcie30>;
 	status = "disabled";
 };
 
 &pcie3x4_ep {
+	/* The x4 controller is used in EP mode with two lanes */
 	vpcie3v3-supply = <&vcc3v3_pcie30>;
+	num-lanes = <2>;
 	status = "okay";
 };
 
