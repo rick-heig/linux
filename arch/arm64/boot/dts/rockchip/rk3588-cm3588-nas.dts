@@ -474,7 +474,7 @@
 	phys = <&pcie30phy>;
 	num-lanes = <1>;
 	max-link-speed = <2>;
-	status = "okay";
+	status = "disabled";
 };
 
 &pcie2x1l2 {
@@ -486,8 +486,8 @@
 };
 
 &pcie30phy {
-	data-lanes = <&pcie3x4_ep &pcie3x4_ep &pcie3x2 &pcie2x1l1>;
-	/* data-lanes = <1 1 2 4>; */
+	data-lanes = <&pcie3x4_ep &pcie3x4_ep &pcie3x2 &pcie3x2>;
+	/* data-lanes = <1 1 2 2>; */
 	status = "okay";
 };
 
@@ -495,7 +495,7 @@
 	reset-gpios = <&gpio4 RK_PB3 GPIO_ACTIVE_HIGH>;
 	/* TODO pin-ctrl */
 	vpcie3v3-supply = <&vcc3v3_pcie30>;
-	num-lanes = <1>;
+	num-lanes = <2>;
 	status = "okay";
 };
 
