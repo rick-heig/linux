@@ -154,6 +154,7 @@ static int rockchip_p3phy_rk3588_init(struct rockchip_p3phy_priv *priv)
 	/* Set bifurcation if needed */
 	if (priv->num_lanes == 1) {
 		reg = RK3588_LANE_AGGREGATION;
+		/* TODO : This should also be set when all 4 lanes go to the x4 controller */
 	} else {
 		if (priv->num_lanes >= 2) {
 			if (priv->lanes[0] != priv->lanes[1]) {
@@ -168,14 +169,18 @@ static int rockchip_p3phy_rk3588_init(struct rockchip_p3phy_priv *priv)
 	}
 
 	dev_info(&priv->phy->dev, "Bifurcation reg : %#08x\n", reg);
+	/* Note : the two bifurcation bits become invalid when aggregation is selected */
 	regmap_write(priv->phy_grf, RK3588_PCIE3PHY_GRF_CMN_CON0, (0x7<<16) | reg);
 
 	/* Set pcie1ln_sel in PHP_GRF_PCIESEL_CON */
+	/* This should be written to PHP GRF and not PIPE GRF ! */
 	if (!IS_ERR(priv->pipe_grf)) {
-		reg = reg & (RK3588_BIFURCATION_LANE_0_1 | RK3588_BIFURCATION_LANE_2_3);
+		reg = RK3588_BIFURCATION_LANE_0_1 | RK3588_BIFURCATION_LANE_2_3;
 		if (reg)
 			regmap_write(priv->pipe_grf, PHP_GRF_PCIESEL_CON,
 				     (reg << 16) | reg);
+	} else {
+		dev_warn(&priv->phy->dev, "Could not access PIPE GRF");
 	}
 
 	reset_control_deassert(priv->p30phy);
