@@ -57,3 +57,13 @@ config PCI_EPF_NVME
 	   driver for PCI Endpoint.
 
 	   If in doubt, say "N" to disable Endpoint NVMe function driver.
+
+config PCI_EPF_CHAR
+	tristate "PCI Endpoint char driver"
+	depends on PCI_ENDPOINT
+	select CRC32
+	help
+	   Enable this configuration option to enable the char driver
+	   for PCI Endpoint.
+
+	   If in doubt, say "N" to disable Endpoint char driver.
