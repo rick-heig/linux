@@ -2173,7 +2173,7 @@ static int pci_epf_nvme_init_irq(struct pci_epf *epf)
 	int ret;
 
 	/* Enable MSIX if supported, otherwise, use MSI */
-	if (epf_nvme->epc_features->msix_capable) {
+	if (epf_nvme->epc_features->msix_capable && epf->msix_interrupts) {
 		ret = pci_epf_set_msix(epf, epf->msix_interrupts,
 				       epf_nvme->reg_bar,
 				       epf_nvme->msix_table_offset);
@@ -2188,7 +2188,7 @@ static int pci_epf_nvme_init_irq(struct pci_epf *epf)
 		return 0;
 	}
 
-	if (epf_nvme->epc_features->msi_capable) {
+	if (epf_nvme->epc_features->msi_capable && epf->msi_interrupts) {
 		ret = pci_epf_set_msi(epf, epf->msi_interrupts);
 		if (ret) {
 			dev_err(&epf->dev, "MSI configuration failed\n");
