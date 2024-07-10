@@ -800,8 +800,12 @@ static int pci_epf_nvme_cmd_parse_prp_list(struct pci_epf_nvme *epf_nvme,
 		if (prp != pci_addr) {
 			/* Discontiguous prp: new segment */
 			nr_segs++;
-			if (WARN_ON_ONCE(nr_segs > epcmd->nr_segs))
+			if (WARN_ON_ONCE(nr_segs > epcmd->nr_segs)) {
+				dev_err(&epf_nvme->epf->dev,
+					"Number of required segments is bigger than %d, size : %zu\n",
+					epcmd->nr_segs, size);
 				goto internal;
+			}
 
 			seg++;
 			seg->pci_addr = prp;
@@ -1753,6 +1757,33 @@ static void pci_epf_nvme_identify_hook(struct pci_epf_nvme_cmd *epcmd)
 
 	/* Indicate no support for SGLs */
 	id->sgls = 0;
+
+	/* Implementations before 1.4 may report a value of 0h (Fig. 276 Base Specs)*/
+	if (((id->ver && GENMASK(31, 16)) >> 16) < cpu_to_le16(2)) {
+		if (((id->ver && GENMASK(15, 8)) >> 8) < 4 ) {
+			id->cntrltype = 0;
+		}
+	}
+
+	/* Indicate no support for Asymmetric Namespace Access (ANA) */
+	id->anatt = 0;
+	id->anacap = 0;
+	id->anagrpmax = 0;
+	id->nanagrpid = 0;
+
+	/* Maximum outstanding commands is optional for NVMe over PCIe */
+	id->maxcmd = 0;
+
+	/* Number of Namespaces should be 1 */
+	id->nn = cpu_to_le32(1);
+	id->mnan = 0;
+
+	/* Clear fabrics specific values */
+	id->ioccsz = 0;
+	id->iorcsz = 0;
+
+	/* Set power state info */
+	id->psd[0].max_power = cpu_to_le16(700); /* centiwatts */
 }
 
 static void pci_epf_nvme_get_log_hook(struct pci_epf_nvme_cmd *epcmd)
@@ -1793,22 +1824,28 @@ static bool pci_epf_nvme_process_set_features(struct pci_epf_nvme_cmd *epcmd)
 	struct pci_epf_nvme *epf_nvme = epcmd->epf_nvme;
 	u32 cdw10 = le32_to_cpu(epcmd->cmd.common.cdw10);
 	u32 cdw11 = le32_to_cpu(epcmd->cmd.common.cdw11);
+	u8 feat = cdw10 & 0xff;
 	u16 nsqr, ncqr;
 
-	if ((cdw10 & 0xff) != NVME_FEAT_NUM_QUEUES)
-		return false;
+	if (feat == NVME_FEAT_NUM_QUEUES) {
+		ncqr = (cdw11 >> 16) & 0xffff;
+		nsqr = cdw11 & 0xffff;
+		if (ncqr == 0xffff || nsqr == 0xffff) {
+			epcmd->status = NVME_SC_INVALID_FIELD | NVME_SC_DNR;
+			return true;
+		}
 
-	ncqr = (cdw11 >> 16) & 0xffff;
-	nsqr = cdw11 & 0xffff;
-	if (ncqr == 0xffff || nsqr == 0xffff) {
-		epcmd->status = NVME_SC_INVALID_FIELD | NVME_SC_DNR;
+		epcmd->cqe.result.u32 = cpu_to_le32((epf_nvme->qid_max - 1) |
+						((epf_nvme->qid_max - 1) << 16));
 		return true;
-	}
-
-	epcmd->cqe.result.u32 = cpu_to_le32((epf_nvme->qid_max - 1) |
-					    ((epf_nvme->qid_max - 1) << 16));
-
-	return true;
+	} else if (feat == NVME_FEAT_IRQ_COALESCE) {
+		epcmd->status = NVME_SC_SUCCESS;
+		return true;
+	} else if (feat == NVME_FEAT_ARBITRATION) {
+		epcmd->status = NVME_SC_SUCCESS;
+		return true;
+	} else
+		return false;
 }
 
 static void pci_epf_nvme_process_admin_cmd(struct pci_epf_nvme_cmd *epcmd)
@@ -1821,6 +1858,9 @@ static void pci_epf_nvme_process_admin_cmd(struct pci_epf_nvme_cmd *epcmd)
 	switch (cmd->common.opcode) {
 	case nvme_admin_identify:
 		post_exec_hook = pci_epf_nvme_identify_hook;
+		dev_dbg(&epf_nvme->epf->dev,
+			"Command %s, CNS : %d\n",
+			pci_epf_nvme_cmd_name(epcmd), cmd->identify.cns);
 		epcmd->buffer_size = NVME_IDENTIFY_DATA_SIZE;
 		epcmd->dma_dir = DMA_TO_DEVICE;
 		break;
@@ -1844,10 +1884,16 @@ static void pci_epf_nvme_process_admin_cmd(struct pci_epf_nvme_cmd *epcmd)
 		return;
 
 	case nvme_admin_set_features:
+		dev_dbg(&epf_nvme->epf->dev,
+			"Command %s, FID : %#08x\n",
+			pci_epf_nvme_cmd_name(epcmd), cmd->features.fid);
 		if (pci_epf_nvme_process_set_features(epcmd))
 			goto complete;
 		break;
 	case nvme_admin_get_features:
+		dev_dbg(&epf_nvme->epf->dev,
+			"Command %s, FID : %#08x\n",
+			pci_epf_nvme_cmd_name(epcmd), cmd->features.fid);
 	case nvme_admin_abort_cmd:
 		break;
 
