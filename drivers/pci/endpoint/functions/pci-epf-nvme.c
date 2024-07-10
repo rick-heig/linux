@@ -2013,7 +2013,7 @@ static int pci_epf_nvme_set_bars(struct pci_epf *epf)
 	int bar, add;
 	int ret;
 
-	for (bar = BAR_0; bar < PCI_STD_NUM_BARS; bar += add) {
+	for (bar = BAR_0; bar < BAR_1; bar += add) {
 		epf_bar = &epf->bar[bar];
 
 		/*
@@ -2110,7 +2110,7 @@ static int pci_epf_nvme_configure_bars(struct pci_epf *epf)
 	epf_nvme->reg_bar = bar;
 
 	/* Initialize BAR flags */
-	for (bar = BAR_0; bar < PCI_STD_NUM_BARS; bar++) {
+	for (bar = BAR_0; bar < BAR_1; bar++) {
 		epf_bar = &epf->bar[bar];
 		if (features->bar_fixed_64bit & (1 << bar))
 			epf_bar->flags |= PCI_BASE_ADDRESS_MEM_TYPE_64;
@@ -2122,7 +2122,7 @@ static int pci_epf_nvme_configure_bars(struct pci_epf *epf)
 		return ret;
 
 	/* Allocate remaining BARs */
-	for (bar = BAR_0; bar < PCI_STD_NUM_BARS; bar += add) {
+	for (bar = BAR_0; bar < BAR_1; bar += add) {
 		epf_bar = &epf->bar[bar];
 		if (epf_bar->flags & PCI_BASE_ADDRESS_MEM_TYPE_64)
 			add = 2;
@@ -2156,7 +2156,7 @@ static void pci_epf_nvme_clear_bars(struct pci_epf *epf)
 	const struct pci_epc_features *features = epf_nvme->epc_features;
 	int bar;
 
-	for (bar = BAR_0; bar < PCI_STD_NUM_BARS; bar++) {
+	for (bar = BAR_0; bar < BAR_1; bar++) {
 		if (!epf_nvme->reg[bar] ||
 		    features->reserved_bar & (1 << bar))
 			continue;
