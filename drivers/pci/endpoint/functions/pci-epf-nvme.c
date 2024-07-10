@@ -1683,7 +1683,7 @@ static void pci_epf_nvme_create_sq(struct pci_epf_nvme *epf_nvme,
 	}
 
 	sq_flags = le16_to_cpu(cmd->create_sq.sq_flags);
-	if (sq_flags != NVME_QUEUE_PHYS_CONTIG) {
+	if (!(sq_flags & NVME_QUEUE_PHYS_CONTIG)) {
 		epcmd->status = NVME_SC_INVALID_QUEUE | NVME_SC_DNR;
 		return;
 	}
