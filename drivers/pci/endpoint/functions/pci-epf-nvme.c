@@ -1755,6 +1755,39 @@ static void pci_epf_nvme_identify_hook(struct pci_epf_nvme_cmd *epcmd)
 	id->sgls = 0;
 }
 
+static void pci_epf_nvme_get_log_hook(struct pci_epf_nvme_cmd *epcmd)
+{
+	struct nvme_command *cmd = &epcmd->cmd;
+	struct nvme_effects_log *log = epcmd->buffer;
+
+	if (cmd->get_log_page.lid != NVME_LOG_CMD_EFFECTS)
+		return;
+
+	/*
+	 * ACS0     [Delete I/O Submission Queue     ] 00000001
+	 * CSUPP+  LBCC-  NCC-  NIC-  CCC-  USS-  No command restriction
+	 */
+	log->acs[0] |= cpu_to_le32(NVME_CMD_EFFECTS_CSUPP);
+
+	/*
+	 * ACS1     [Create I/O Submission Queue     ] 00000001
+	 * CSUPP+  LBCC-  NCC-  NIC-  CCC-  USS-  No command restriction
+	 */
+	log->acs[1] |= cpu_to_le32(NVME_CMD_EFFECTS_CSUPP);
+
+	/*
+	 * ACS4     [Delete I/O Completion Queue     ] 00000001
+	 * CSUPP+  LBCC-  NCC-  NIC-  CCC-  USS-  No command restriction
+	 */
+	log->acs[4] |= cpu_to_le32(NVME_CMD_EFFECTS_CSUPP);
+
+	/*
+	 * ACS5     [Create I/O Completion Queue     ] 00000001
+	 * CSUPP+  LBCC-  NCC-  NIC-  CCC-  USS-  No command restriction
+	 */
+	log->acs[5] |= cpu_to_le32(NVME_CMD_EFFECTS_CSUPP);
+}
+
 static bool pci_epf_nvme_process_set_features(struct pci_epf_nvme_cmd *epcmd)
 {
 	struct pci_epf_nvme *epf_nvme = epcmd->epf_nvme;
@@ -1793,6 +1826,7 @@ static void pci_epf_nvme_process_admin_cmd(struct pci_epf_nvme_cmd *epcmd)
 		break;
 
 	case nvme_admin_get_log_page:
+		post_exec_hook = pci_epf_nvme_get_log_hook;
 		epcmd->buffer_size = nvme_get_log_page_len(cmd);
 		epcmd->dma_dir = DMA_TO_DEVICE;
 		break;
