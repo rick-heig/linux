@@ -19,4 +19,5 @@
 &pcie3x4_ep {
 	vpcie3v3-supply = <&vcc3v3_pcie30>;
 	status = "okay";
+	max-link-speed = <2>;
 };

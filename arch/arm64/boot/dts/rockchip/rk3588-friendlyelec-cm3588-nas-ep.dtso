@@ -20,4 +20,5 @@
 	vpcie3v3-supply = <&vcc_3v3_m2_a>;
 	num-lanes = <1>;
 	status = "okay";
+	max-link-speed = <2>;
 };
